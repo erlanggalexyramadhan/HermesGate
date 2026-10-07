@@ -1,10 +1,18 @@
 import { useEffect, useState } from "react";
-import { core, type AppInfo, type ModuleInfo } from "./lib/tauri";
+import {
+  core,
+  devices,
+  type AppInfo,
+  type ModuleInfo,
+  type DeviceSnapshot,
+} from "./lib/tauri";
 import "./App.css";
 
-const NAV: { id: string; label: string; ready: boolean }[] = [
+type View = "dashboard" | "devices" | "mirroring" | "settings";
+
+const NAV: { id: View; label: string; ready: boolean }[] = [
   { id: "dashboard", label: "Dashboard", ready: true },
-  { id: "devices", label: "Devices", ready: false },
+  { id: "devices", label: "Devices", ready: true },
   { id: "mirroring", label: "Mirroring", ready: false },
   { id: "settings", label: "Settings", ready: false },
 ];
@@ -16,6 +24,7 @@ type Load =
 
 function App() {
   const [load, setLoad] = useState<Load>({ status: "loading" });
+  const [view, setView] = useState<View>("dashboard");
 
   useEffect(() => {
     let alive = true;
@@ -51,8 +60,9 @@ function App() {
             <button
               key={item.id}
               type="button"
-              className={`nav-item${item.ready ? " is-active" : ""}`}
+              className={`nav-item${view === item.id ? " is-active" : ""}`}
               disabled={!item.ready}
+              onClick={() => setView(item.id)}
             >
               <span>{item.label}</span>
               {!item.ready && <span className="nav-tag">Soon</span>}
@@ -68,7 +78,7 @@ function App() {
 
       <main className="main">
         <header className="topbar">
-          <h1>Dashboard</h1>
+          <h1>{NAV.find((item) => item.id === view)?.label ?? "Dashboard"}</h1>
           {load.status === "ready" && (
             <span className="chip">
               {load.app.platform} / {load.app.arch}
@@ -77,11 +87,11 @@ function App() {
         </header>
 
         <div className="content">
-          {load.status === "loading" && (
+          {view === "dashboard" && load.status === "loading" && (
             <p className="muted">Contacting the native core…</p>
           )}
 
-          {load.status === "error" && (
+          {view === "dashboard" && load.status === "error" && (
             <div className="banner">
               Native bridge unavailable — this UI must run inside the
               HermesGate shell (<code>npm run tauri dev</code>).
@@ -89,7 +99,7 @@ function App() {
             </div>
           )}
 
-          {load.status === "ready" && (
+          {view === "dashboard" && load.status === "ready" && (
             <>
               <section className="cards">
                 <article className="card">
@@ -141,9 +151,117 @@ function App() {
               </section>
             </>
           )}
+
+          {view === "devices" && <DevicesPanel />}
         </div>
       </main>
     </div>
+  );
+}
+
+/**
+ * Devices view. Discovery itself is native: the Rust core polls `adb`,
+ * keeps device state, and pushes a `devices-changed` event whenever the
+ * picture changes. This component only fetches the first snapshot, listens,
+ * and renders it.
+ */
+function DevicesPanel() {
+  const [snapshot, setSnapshot] = useState<DeviceSnapshot | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    devices
+      .list()
+      .then((next) => {
+        if (alive) setSnapshot(next);
+      })
+      .catch((err) => {
+        if (alive) setError(String(err));
+      });
+    const unlisten = devices.onChanged((next) => {
+      if (alive) setSnapshot(next);
+    });
+    return () => {
+      alive = false;
+      unlisten.then((off) => off());
+    };
+  }, []);
+
+  if (error) {
+    return (
+      <div className="banner">
+        Device service unavailable — the native core did not answer.
+        <div className="banner-detail">{error}</div>
+      </div>
+    );
+  }
+
+  if (!snapshot) {
+    return <p className="muted">Reading devices…</p>;
+  }
+
+  const { adb, devices: list } = snapshot;
+  return (
+    <>
+      {adb.error && (
+        <div className="banner">
+          ADB problem — device detection is degraded.
+          <div className="banner-detail">{adb.error}</div>
+        </div>
+      )}
+
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Android devices</h2>
+          <span className="chip">
+            {adb.error
+              ? "adb error"
+              : adb.available
+                ? `adb · ${adb.source ?? "ready"}`
+                : "adb unavailable"}{" "}
+            · {list.length} attached
+          </span>
+        </div>
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Device</th>
+              <th>Model</th>
+              <th>Android</th>
+              <th>Transport</th>
+              <th className="col-state">State</th>
+            </tr>
+          </thead>
+          <tbody>
+            {list.length === 0 ? (
+              <tr>
+                <td className="muted" colSpan={5}>
+                  {adb.error
+                    ? "No devices: the ADB call failed (see the banner above)."
+                    : "No Android devices attached — connect one over USB and allow USB debugging."}
+                </td>
+              </tr>
+            ) : (
+              list.map((device) => (
+                <tr key={device.serial}>
+                  <td>
+                    {device.serial}
+                    {device.manufacturer && <p className="muted">{device.manufacturer}</p>}
+                  </td>
+                  <td className="muted">{device.model ?? "—"}</td>
+                  <td className="muted">{device.androidVersion ?? "—"}</td>
+                  <td className="muted">{device.transport}</td>
+                  <td className="col-state">
+                    <span className="state">{device.state}</span>
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </section>
+    </>
   );
 }
 

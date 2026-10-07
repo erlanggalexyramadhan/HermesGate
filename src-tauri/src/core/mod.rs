@@ -18,8 +18,9 @@
 //! | [`clipboard`]   | Clipboard synchronisation between desktop and device       |
 //! | [`settings`]    | Persisted application settings                             |
 //!
-//! The bootstrap ships these boundaries plus the module registry; the
-//! behaviours themselves are roadmap items (`docs/roadmap.md`).
+//! The registry reports each module's real state: `device` and `adb` are
+//! implemented for USB device detection, the rest are roadmap items
+//! (`docs/roadmap.md`).
 
 pub mod adb;
 pub mod clipboard;
@@ -32,10 +33,11 @@ pub mod video;
 
 use serde::Serialize;
 
-/// Bootstrap state of a core module.
+/// State of a core module.
 ///
-/// Always `"planned"` for now. Unknown values are rendered generically by the
-/// UI, so new states can be introduced per module without touching this crate.
+/// `"planned"`, `"partial"` or `"ready"`. Unknown values are rendered
+/// generically by the UI, so new states can be introduced per module without
+/// touching this crate.
 pub type ModuleState = &'static str;
 
 /// One row of the native core registry, surfaced to the UI by
@@ -47,7 +49,7 @@ pub struct ModuleInfo {
     pub id: &'static str,
     /// Human-readable module name.
     pub name: &'static str,
-    /// Current [`ModuleState`] (`"planned"` at bootstrap).
+    /// Current [`ModuleState`] (`"planned"`, `"partial"` or `"ready"`).
     pub state: ModuleState,
     /// What the module is responsible for.
     pub responsibility: &'static str,
@@ -58,19 +60,19 @@ pub const MODULES: &[ModuleInfo] = &[
     ModuleInfo {
         id: "device",
         name: "Device Manager",
-        state: "planned",
+        state: "ready",
         responsibility: "Discover, identify and track connected Android devices.",
     },
     ModuleInfo {
         id: "connection",
         name: "Connection Manager",
-        state: "planned",
+        state: "partial",
         responsibility: "USB and Wi-Fi transports, wireless pairing and discovery.",
     },
     ModuleInfo {
         id: "adb",
         name: "ADB Integration",
-        state: "planned",
+        state: "ready",
         responsibility: "Single gateway to adb; no other module shells out.",
     },
     ModuleInfo {

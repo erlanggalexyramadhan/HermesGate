@@ -4,17 +4,25 @@
 Android device, built for low-latency use cases such as content creation and OBS
 workflows.
 
-> **Status: bootstrap.** This repository currently contains the application
-> foundation — a Tauri 2 shell, a React + TypeScript UI, and a Rust native core
-> with its module boundaries defined. ADB integration, screen mirroring, input
-> injection and wireless pairing are **not implemented yet**; they are staged in
-> the [roadmap](docs/roadmap.md).
+> **Status: Phase 1 (device detection).** This repository ships the application
+> foundation — a Tauri 2 shell, a React + TypeScript UI, and a Rust native core —
+> plus **USB Android device detection**: HermesGate bundles its own ADB runtime,
+> enumerates attached devices with their state and basic metadata, and shows them
+> in the Devices view. Screen mirroring, input injection and wireless pairing are
+> **not implemented yet**; they are staged in the
+> [roadmap](docs/roadmap.md).
 
 ## What exists today
 
 - **Tauri 2 desktop shell** — main window, CSP, capability-scoped webview.
 - **React 19 + TypeScript frontend** — dashboard UI that talks to the native core
   through typed Tauri commands only.
+- **USB device detection** — the bundled `adb` runtime
+  (`src-tauri/binaries/`, official platform-tools) enumerates attached Android
+  devices; states (online / unauthorized / offline / disconnected) and metadata
+  (serial, manufacturer, model, Android version) are kept by the Rust core and
+  pushed to the Devices view through a Tauri event. No Android SDK install is
+  required.
 - **Rust native core** — module boundaries for Device Manager, Connection Manager
   (USB/Wi-Fi), ADB, Mirroring, Input, Video/Rendering, Clipboard and Settings,
   plus a module registry surfaced in the UI.

@@ -22,3 +22,15 @@ pub enum Transport {
     /// Device reached over the network (pairing / discovery).
     Wifi,
 }
+
+impl Transport {
+    /// Transport implied by an ADB serial: network devices are addressed as
+    /// `ip:port`, USB devices by their hardware serial.
+    pub fn for_serial(serial: &str) -> Self {
+        if serial.contains(':') {
+            Transport::Wifi
+        } else {
+            Transport::Usb
+        }
+    }
+}

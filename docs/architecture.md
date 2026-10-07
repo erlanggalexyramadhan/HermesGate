@@ -22,8 +22,11 @@ UI (React + TypeScript, webview)
 
 Implemented today: the layering itself, the command layer
 (`src-tauri/src/commands.rs`), the module tree
-(`src-tauri/src/core/`), and the module registry that the dashboard displays.
-All behavioural modules are *planned*.
+(`src-tauri/src/core/`), the module registry that the dashboard displays, and
+device detection: `adb` locates and runs the bundled ADB runtime, `device` keeps
+device state and exposes it through the `list_devices` command and the
+`devices-changed` event. The `mirroring`, `input`, `video`, `clipboard` and
+`settings` modules are *planned*.
 
 ## Security boundary
 
@@ -34,6 +37,27 @@ All behavioural modules are *planned*.
   `src-tauri/src/lib.rs`, each implemented in Rust.
 - A strict CSP is configured for release builds (`app.security.csp` in
   `src-tauri/tauri.conf.json`), with a dev-only relaxation for Vite HMR.
+
+## Device detection (*implemented*)
+
+- **ADB runtime:** HermesGate ships the official `adb` binary in
+  `src-tauri/binaries/` (Windows; bundled as a resource via
+  `tauri.conf.json → bundle.resources`) so ordinary users need no Android SDK.
+  `src-tauri/src/core/adb.rs` resolves it in order: `HERMESGATE_ADB` override →
+  bundled binary → `PATH` → default SDK install. It is the only module that
+  spawns `adb`; calls time out after 10 s instead of hanging a command.
+- **Discovery:** `core::device::DeviceManager::refresh()` runs
+  `adb devices -l`, maps each line to a state (`device` → online,
+  `unauthorized` → unauthorized, anything else → offline), and marks devices no
+  longer listed as disconnected. Online devices are identified once with
+  `getprop` (manufacturer, model, Android version) and cached.
+- **Interface:** the `list_devices` command returns a snapshot
+  (devices + ADB status); a background watcher polls every 2 s and emits
+  `devices-changed` only when the snapshot actually changes. The Devices view
+  (`src/App.tsx`) reads both through the typed wrappers in `src/lib/tauri.ts`.
+- **Transport:** each device is tagged `usb` or `wifi` from its serial
+  (`ip:port` ⇒ Wi-Fi), so wireless devices will flow through the same
+  `Transport` seam once pairing lands.
 
 ## Connection Manager: USB and Wi-Fi share one pipeline
 
@@ -88,7 +112,8 @@ explicitly out of scope for the bootstrap; see the [roadmap](roadmap.md).
 
 - `src/lib/tauri.ts` — typed wrappers around each Tauri command; the only place
   that calls `invoke`.
-- `src/App.tsx` — application shell: sidebar navigation (future sections are
-  visibly disabled), dashboard content.
+- `src/App.tsx` — application shell: sidebar navigation (mirroring and settings
+  are visibly disabled), the dashboard, and the Devices view backed by the
+  `list_devices` command / `devices-changed` event.
 - `src/App.css` — design tokens and components; light, professional styling with
   no framework dependency.

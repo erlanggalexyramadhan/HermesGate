@@ -34,7 +34,7 @@ trigger a rebuild.
 | `npm run tauri build` | Production bundle (installer + binaries) |
 | `cargo fmt --all` (in `src-tauri/`) | Format the Rust core |
 | `cargo clippy --all-targets` (in `src-tauri/`) | Lint the Rust core |
-| `cargo test` (in `src-tauri/`) | Run Rust tests (none yet) |
+| `cargo test` (in `src-tauri/`) | Run Rust tests (ADB parsing / state mapping) |
 
 ## Project structure
 
@@ -47,6 +47,8 @@ src-tauri/               Rust crate (`hermesgate`)
   src/commands.rs        command layer — the only frontend surface
   src/core/              native core boundaries (device, connection, adb,
                          mirroring, input, video, clipboard, settings)
+  binaries/              bundled ADB runtime (adb.exe + DLLs from Google
+                         platform-tools — the only `adb` HermesGate runs)
   tauri.conf.json        window, CSP, bundling
   capabilities/          webview permissions (core:default only)
 docs/                    architecture, roadmap, ADRs
@@ -65,6 +67,17 @@ docs/                    architecture, roadmap, ADRs
   up in the dashboard.
 - **Documentation:** architecture changes get an ADR in `docs/adr/`, and
   `README.md` / `docs/` must keep describing what actually ships.
+
+## ADB runtime
+
+HermesGate ships its own `adb` (the official platform-tools binary plus its
+DLLs, Windows) in `src-tauri/binaries/`, so no Android SDK install is needed to
+detect devices. The Rust core resolves `adb` in this order:
+
+1. `HERMESGATE_ADB` environment variable (authoritative; errors loudly if wrong)
+2. the bundled binary (installed layout, then the development tree)
+3. `PATH`
+4. the default Android SDK location (`%LOCALAPPDATA%\Android\Sdk\platform-tools`)
 
 ## Troubleshooting
 

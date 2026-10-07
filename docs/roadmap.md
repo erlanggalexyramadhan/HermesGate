@@ -1,9 +1,10 @@
 # Roadmap
 
-Phases are ordered by dependency. **Phase 0 is what this repository ships
-today**; every later phase is planned work and is not implemented yet.
+Phases are ordered by dependency. **Phase 0 and USB device detection (the first
+part of Phase 1) are what this repository ships today**; everything else is
+planned work and is not implemented yet.
 
-## Phase 0 — Foundation *(current)*
+## Phase 0 — Foundation *(done)*
 
 - Tauri 2 application with a React + TypeScript frontend.
 - Rust native core with module boundaries and a command layer.
@@ -11,12 +12,20 @@ today**; every later phase is planned work and is not implemented yet.
 - Light professional UI shell with dashboard and module registry.
 - CI, documentation, ADRs, project metadata.
 
-## Phase 1 — Device and connection
+## Phase 1 — Device and connection *(current)*
 
-- ADB integration: locate/spawn `adb`, list devices, watch attach/detach.
+Shipped:
+
+- ADB integration: HermesGate bundles its own `adb` runtime (no Android SDK
+  install), resolves it (override → bundled → `PATH` → SDK) and parses
+  `adb devices -l` / `getprop` for state and metadata.
+- Device Manager state exposed through the `list_devices` command and the
+  `devices-changed` event, rendered in the Devices view.
+
+Remaining:
+
 - USB transport: connected-device sessions over the local ADB daemon.
 - Wi-Fi transport: wireless pairing and discovery (mDNS / `adb pair`).
-- Device Manager state exposed through commands and rendered in the Devices view.
 
 ## Phase 2 — Mirroring pipeline
 

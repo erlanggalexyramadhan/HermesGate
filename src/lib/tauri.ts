@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 /** Application and runtime facts reported by the Rust core. */
 export interface AppInfo {
@@ -12,9 +13,36 @@ export interface AppInfo {
 export interface ModuleInfo {
   id: string;
   name: string;
-  /** Bootstrap state, e.g. `"planned"`. */
+  /** Module lifecycle: `planned`, `partial` or `ready`. */
   state: string;
   responsibility: string;
+}
+
+/** Lifecycle of a known device. */
+export type DeviceState = "online" | "unauthorized" | "offline" | "disconnected";
+
+/** One Android device as reported by the Rust core. */
+export interface DeviceInfo {
+  serial: string;
+  state: DeviceState;
+  transport: "usb" | "wifi";
+  manufacturer: string | null;
+  model: string | null;
+  androidVersion: string | null;
+}
+
+/** Availability of the ADB runtime, reported with every device list. */
+export interface AdbStatus {
+  available: boolean;
+  source: string | null;
+  path: string | null;
+  error: string | null;
+}
+
+/** Result of one device refresh. */
+export interface DeviceSnapshot {
+  devices: DeviceInfo[];
+  adb: AdbStatus;
 }
 
 /**
@@ -26,4 +54,15 @@ export interface ModuleInfo {
 export const core = {
   appInfo: () => invoke<AppInfo>("get_app_info"),
   coreStatus: () => invoke<ModuleInfo[]>("get_core_status"),
+};
+
+/**
+ * Device listing lives entirely on the native side: `list` asks the Rust core
+ * for a snapshot, `onChanged` streams the `devices-changed` event it emits
+ * when a device is attached, detached or changes state.
+ */
+export const devices = {
+  list: () => invoke<DeviceSnapshot>("list_devices"),
+  onChanged: (handler: (snapshot: DeviceSnapshot) => void) =>
+    listen<DeviceSnapshot>("devices-changed", (event) => handler(event.payload)),
 };
