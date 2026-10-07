@@ -1,0 +1,31 @@
+[package]
+name = "hermesgate"
+version = "0.1.0"
+description = "HermesGate — Android mirroring and control for the desktop, by Lex"
+authors = ["Erlangga Lexy Ramadhan"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/erlanggalexyramadhan/HermesGate"
+readme = "../README.md"
+
+[lib]
+# The `_lib` suffix keeps the lib name unique from the bin name on Windows:
+# https://github.com/rust-lang/cargo/issues/8519
+name = "hermesgate_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
