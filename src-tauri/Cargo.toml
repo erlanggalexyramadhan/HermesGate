@@ -29,3 +29,8 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_LibraryLoader"] }
+# Direct dependency: the #[implement] macro expands to `windows_core::…` paths.
+windows-core = "0.62"

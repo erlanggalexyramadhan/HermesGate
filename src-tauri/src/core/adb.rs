@@ -129,7 +129,7 @@ pub fn resolve() -> Result<Adb, String> {
 }
 
 /// Run one `adb` command and return its standard output.
-fn run(adb: &Path, args: &[&str]) -> Result<String, String> {
+pub fn run(adb: &Path, args: &[&str]) -> Result<String, String> {
     let mut child = Command::new(adb)
         .args(args)
         .stdin(Stdio::null())
@@ -174,6 +174,20 @@ fn run(adb: &Path, args: &[&str]) -> Result<String, String> {
         )),
         Err(error) => Err(error),
     }
+}
+
+/// Spawn `adb` as a long-lived child process (no timeout, output piped).
+///
+/// Used by the mirroring session for the scrcpy server shell command, which
+/// lives as long as the session. The caller owns the child and must reap it.
+pub fn spawn(adb: &Path, args: &[&str]) -> Result<std::process::Child, String> {
+    Command::new(adb)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to start adb: {error}"))
 }
 
 /// Enumerate attached devices (`adb devices -l`).
