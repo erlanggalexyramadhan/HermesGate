@@ -79,3 +79,51 @@ pub fn watch_devices(
         }
     });
 }
+
+/// Broadcast on every mirror status change; payload is a
+/// [`core::mirroring::MirrorStatus`].
+pub const MIRROR_CHANGED: &str = "mirror-changed";
+
+/// Start mirroring `serial` with the default quality knobs (the engine's
+/// scrcpy defaults: native resolution, 8 Mbit/s, uncapped fps).
+#[tauri::command]
+pub fn start_mirror(serial: String) -> Result<(), String> {
+    core::mirroring::request_start(&serial, core::mirroring::MirrorQuality::default())
+}
+
+/// Stop the active mirror session. Idempotent: stopping while idle is a
+/// no-op, matching the engine's [`core::mirroring::request_stop`].
+#[tauri::command]
+pub fn stop_mirror() -> Result<(), String> {
+    core::mirroring::request_stop()
+}
+
+/// Current mirror session status (the idle default when nothing ever ran).
+#[tauri::command]
+pub fn mirror_status() -> core::mirroring::MirrorStatus {
+    core::mirroring::poll_status()
+}
+
+/// Poll the mirror engine and broadcast a fresh snapshot as
+/// [`MIRROR_CHANGED`] whenever something actually changed (phase, reason,
+/// frame size, serial).
+///
+/// ponytail: a 1 s poll instead of hooking every engine transition — the
+/// engine already keeps a plain `MirrorStatus`, and a UI that reacts within
+/// a second needs no event plumbing inside the session lifecycle. Switch to
+/// direct emits only if sub-second latency ever matters.
+pub fn watch_mirror(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        use tauri::Emitter;
+
+        let mut last: Option<core::mirroring::MirrorStatus> = None;
+        loop {
+            let snapshot = core::mirroring::poll_status();
+            if last.as_ref() != Some(&snapshot) {
+                let _ = app.emit(MIRROR_CHANGED, &snapshot);
+                last = Some(snapshot);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    });
+}

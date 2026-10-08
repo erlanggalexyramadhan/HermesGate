@@ -40,10 +40,24 @@ const SERVER_CLASS: &str = "com.genymobile.scrcpy.Server";
 const SERVER_VERSION: &str = "5.0";
 /// Remote path the server jar is pushed to.
 const REMOTE_JAR: &str = "/data/local/tmp/scrcpy-server.jar";
-/// Handshake budget: connect, then accept the stream only once the forward
-/// actually holds (the server may take a moment to listen).
-const CONNECT_ATTEMPTS: u32 = 15;
+/// Readiness budget: poll the device until it owns the abstract socket
+/// before connecting (~20 s — a cold first start exposes it a few seconds
+/// in, and connecting blind used to give up first).
+const READINESS_ATTEMPTS: u32 = 40;
+const READINESS_INTERVAL: Duration = Duration::from_millis(500);
+/// Connect budget: connect, then accept the stream only once the forward
+/// actually holds (the server may take a moment to listen). Its own budget,
+/// so a socket that appears late still gets connected.
+const CONNECT_ATTEMPTS: u32 = 20;
 const CONNECT_INTERVAL: Duration = Duration::from_millis(300);
+/// How long one accepted connection may stay silent before we decide it is
+/// a healthy session. The scrcpy encoder needs ~0.5 s to emit its first
+/// bytes (measured: TTFB at +0.5 s, then the whole H.264 backlog), so a 2 s
+/// window sits comfortably past warm-up. Distinct from the retry interval:
+/// the server tears itself down when its single accepted connection closes,
+/// so during this window the socket must be *held*, never closed and
+/// retried — only an EOF justifies another attempt.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Basic quality knobs forwarded verbatim to scrcpy (`0` = server default:
 /// native resolution, 8 Mbit/s, uncapped fps).
@@ -128,7 +142,7 @@ impl Session {
                 &adb.path,
                 &["-s", serial, "shell", "pkill", "-f", SERVER_CLASS],
             );
-            let _ = adb::run(&adb.path, &["--remove-forward", &forward_arg]);
+            let _ = adb::run(&adb.path, &["forward", "--remove", &forward_arg]);
         };
 
         let launched = (|| -> Result<Child, String> {
@@ -142,7 +156,7 @@ impl Session {
             );
             // One loopback forward for the video socket. Transport seam: a
             // future Wi-Fi transport replaces this setup, not the pipeline.
-            let _ = adb::run(&adb.path, &["--remove-forward", &forward_arg]);
+            let _ = adb::run(&adb.path, &["forward", "--remove", &forward_arg]);
             adb::run(
                 &adb.path,
                 &["-s", serial, "forward", &forward_arg, &socket_arg],
@@ -161,7 +175,7 @@ impl Session {
             }
         };
 
-        let stream = match wait_for_forward() {
+        let stream = match wait_for_forward(&adb.path, serial) {
             Ok(stream) => stream,
             Err(error) => {
                 cleanup();
@@ -197,7 +211,7 @@ impl Session {
                 // Release the transport whatever ended the stream.
                 let _ = adb::run(
                     &adb_path,
-                    &["--remove-forward", &format!("tcp:{FORWARD_PORT}")],
+                    &["forward", "--remove", &format!("tcp:{FORWARD_PORT}")],
                 );
                 let (phase, reason) = match end {
                     StreamEnd::Stopped => ("stopped", String::new()),
@@ -247,7 +261,7 @@ impl Session {
             );
             let _ = adb::run(
                 &adb.path,
-                &["--remove-forward", &format!("tcp:{FORWARD_PORT}")],
+                &["forward", "--remove", &format!("tcp:{FORWARD_PORT}")],
             );
         }
         if let Some(mut child) = self.child.take() {
@@ -373,45 +387,112 @@ fn server_args(serial: &str, quality: MirrorQuality) -> Vec<String> {
     args
 }
 
-/// Connect to the forwarded port and only hand the socket over once it
-/// actually holds: a forward that immediately EOFs means the server has not
-/// listened yet (or died), so retry within the handshake budget.
-fn wait_for_forward() -> Result<TcpStream, String> {
+/// One readiness probe: does the device itself own the abstract socket?
+/// Only a listening server makes that entry appear, and only then can the
+/// forward possibly hold. `Err` means the probe failed (adb or
+/// `/proc/net/unix` unreadable) — never treat that as "not ready".
+fn device_socket_ready(adb: &std::path::Path, serial: &str) -> Result<bool, String> {
+    let output = adb::run(adb, &["-s", serial, "shell", "cat", "/proc/net/unix"])?;
+    let wanted = format!("@{SOCKET_NAME}");
+    Ok(output
+        .lines()
+        .filter_map(|line| line.split_whitespace().last())
+        .any(|field| field == wanted))
+}
+
+/// Two-stage transport wait. Stage 1 polls the device for the abstract
+/// socket (readiness, ~20 s); stage 2 connects and probes the forward with
+/// its own budget, so a cold first start — socket up seconds in — is no
+/// longer killed by a blind 4.5 s deadline.
+///
+/// Stage 2's invariant: a held-but-silent connection is a healthy session,
+/// only an EOF means retry. The scrcpy server handles exactly one
+/// connection and tears the whole session down when it closes, so every
+/// attempt keeps its accepted stream open for the whole [`PROBE_TIMEOUT`]
+/// probe: data already buffered (`Ok(n)`) or silence without closure
+/// (`Err` timeout/`WouldBlock`, encoder still warming up) are both returned
+/// as the session stream. Only `Ok(0)` — the peer itself closed — or a
+/// failed `connect` drops the attempt and tries again.
+///
+/// An unreadable `/proc/net/unix` must not abort the wait: with no readiness
+/// signal the function falls back to plain connect retries for the full
+/// readiness budget instead.
+fn wait_for_forward(adb: &std::path::Path, serial: &str) -> Result<TcpStream, String> {
+    // Stage 1: readiness on the device side.
+    let mut probe_failed = false;
+    for _ in 0..READINESS_ATTEMPTS {
+        match device_socket_ready(adb, serial) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(_) => {
+                probe_failed = true;
+                break;
+            }
+        }
+        std::thread::sleep(READINESS_INTERVAL);
+    }
+
+    // Stage 2: connect and probe. Without a readiness signal there is
+    // nothing to wait for, so plain-retry for the whole readiness budget.
+    let (attempts, interval) = if probe_failed {
+        (READINESS_ATTEMPTS, READINESS_INTERVAL)
+    } else {
+        (CONNECT_ATTEMPTS, CONNECT_INTERVAL)
+    };
     let mut last = "not reachable".to_string();
-    let mut alive_ticks = 0u32;
-    for _ in 0..CONNECT_ATTEMPTS {
+    for _ in 0..attempts {
+        // One connect per attempt; the accepted stream is held through the
+        // probe below and only dropped on EOF, because closing a connection
+        // the server already accepted ends the whole streaming session.
         match TcpStream::connect(("127.0.0.1", FORWARD_PORT)) {
             Ok(stream) => {
-                let _ = stream.set_read_timeout(Some(CONNECT_INTERVAL));
+                let _ = stream.set_read_timeout(Some(PROBE_TIMEOUT));
                 let mut probe = [0u8; 1];
                 match stream.peek(&mut probe) {
-                    Ok(0) => {
-                        // Remote side closed: server not listening yet.
-                        last = "forward closed (scrcpy server not listening)".to_string();
-                        alive_ticks = 0;
-                    }
+                    // The peer closed: server not listening yet (or it
+                    // died). Drop this connection and retry.
+                    Ok(0) => last = "forward closed (scrcpy server not listening)".to_string(),
+                    // Bytes already waiting: definitely live.
                     Ok(_) => {
-                        // Bytes already waiting: definitely live.
                         let _ = stream.set_read_timeout(None);
                         return Ok(stream);
                     }
-                    Err(_) => {
-                        // Held open but silent (encoder warming up). Accept
-                        // once it survives a few ticks without closing.
-                        alive_ticks += 1;
-                        if alive_ticks >= 3 {
-                            let _ = stream.set_read_timeout(None);
-                            return Ok(stream);
-                        }
-                        last = "forward open, waiting for the server".to_string();
+                    // Held open but silent: the encoder is still warming
+                    // up, which is the normal first ~0.5 s. A healthy
+                    // session — take it now rather than closing the socket
+                    // and killing the server.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        let _ = stream.set_read_timeout(None);
+                        return Ok(stream);
                     }
+                    // Hard read error: the connection is unusable, retry.
+                    Err(error) => last = format!("probe failed: {error}"),
                 }
             }
+            // Retryable hard connect failure (e.g. connection refused).
             Err(error) => last = format!("connect failed: {error}"),
         }
-        std::thread::sleep(CONNECT_INTERVAL);
+        std::thread::sleep(interval);
     }
-    Err(format!("mirror transport did not open: {last}"))
+
+    // Honest timeout: one last probe names the stage that ran out of budget.
+    let stage = match device_socket_ready(adb, serial) {
+        Ok(true) => {
+            format!("socket @{SOCKET_NAME} is up but the forward never became connectable ({last})")
+        }
+        Ok(false) => {
+            format!("socket @{SOCKET_NAME} never appeared — scrcpy server not listening ({last})")
+        }
+        Err(error) => format!(
+            "readiness probe unavailable ({error}); forward never became connectable ({last})"
+        ),
+    };
+    Err(format!("mirror transport did not open: {stage}"))
 }
 
 #[cfg(test)]

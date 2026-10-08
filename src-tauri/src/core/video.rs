@@ -1,16 +1,25 @@
 //! Video: decoder and renderer boundary.
 //!
 //! Receives the raw H.264 byte stream (scrcpy server in `raw_stream=true`
-//! mode) from [`crate::core::mirroring`], decodes it natively through
-//! Windows Media Foundation (hardware decode/convert where available) and
-//! presents frames in a native Win32 mirror window. Frame data stays in
-//! native code and never crosses the JavaScript boundary.
+//! mode) from [`crate::core::mirroring`], splits it into access units and
+//! decodes it through [`crate::core::h264`] — the Windows Media Foundation
+//! H.264 decoder MFT, because a Media Foundation *source reader* cannot open
+//! a containerless Annex-B stream — then presents the frames in a native
+//! Win32 mirror window. Frame data stays in native code and never crosses
+//! the JavaScript boundary.
 //!
 //! The interface is deliberately transport-agnostic: mirroring hands over an
 //! already-connected TCP socket (today via `adb forward`, later possibly
 //! Wi-Fi) and this module only sees "H.264 bytes in, frames on screen".
 //! Decoding and presentation are independent of React, so a future clean
 //! floating mirror window can reuse the same pipeline without decoding twice.
+//!
+//! Presentation follows the decode side. With a hardware Direct3D 11 adapter
+//! the mirror window presents through a DXGI swap chain and the GPU converts
+//! and scales the picture ([`crate::core::gpu`]); the window draws with GDI
+//! otherwise, and drops back to GDI if presenting ever fails. A frame decoded
+//! into a device texture is read back to system memory on its way to GDI, so
+//! every combination of decode and presentation works.
 
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,12 +62,11 @@ pub enum StreamEnd {
     Failed(String),
 }
 
-/// A decoded frame in BGRA order, top-down, `width * 4` bytes per row.
-pub struct Frame {
-    pub width: u32,
-    pub height: u32,
-    pub bgra: Vec<u8>,
-}
+/// One decoded frame, in whichever form the decode side produced it: a device
+/// texture when the decoder ran on the GPU, or system-memory BGRA when it ran
+/// on the CPU. It is the decoder's frame type, re-exported because it is what
+/// crosses the decode-to-window boundary.
+pub use crate::core::h264::Frame;
 
 /// Decode `stream` and present it until the session ends (blocking; runs for
 /// the whole session on the caller's thread).
@@ -91,24 +99,20 @@ pub fn play(
 #[cfg(windows)]
 mod native {
     use super::{Frame, PlaybackControl, StreamEnd};
+    use crate::core::gpu;
+    use crate::core::h264::Decoder;
     use std::cell::RefCell;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-    use windows::core::{
-        implement, w, Error, IUnknown, Ref, Result as WinResult, BOOL, HSTRING, PCWSTR,
-    };
-    use windows::Win32::Foundation::{
-        E_FAIL, E_INVALIDARG, E_NOTIMPL, FALSE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
-    };
+    use std::time::{Duration, Instant};
+    use windows::core::{w, HSTRING, PCWSTR};
+    use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, EndPaint, InvalidateRect, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-        DIB_RGB_COLORS, HBRUSH, HDC, PAINTSTRUCT, SRCCOPY,
+        BeginPaint, EndPaint, InvalidateRect, StretchDIBits, UpdateWindow, BITMAPINFO,
+        BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBRUSH, HDC, PAINTSTRUCT, SRCCOPY,
     };
-    use windows::Win32::Media::MediaFoundation::*;
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -119,264 +123,159 @@ mod native {
     /// Window class registered once per process.
     const CLASS_NAME: PCWSTR = w!("HermesGateMirror");
 
-    // ---------------------------------------------------------------- socket
+    // ----------------------------------------------------------- measurement
 
-    /// `IMFByteStream` backed by the device socket: Media Foundation pulls
-    /// raw H.264 bytes straight off the wire (scrcpy `raw_stream` mode has
-    /// no framing to parse).
-    #[implement(IMFByteStream)]
-    struct SocketStream {
-        stream: Arc<TcpStream>,
-        control: Arc<PlaybackControl>,
-        position: AtomicU64,
+    /// TEMPORARY diagnostics: counters for the existing pipeline stages.
+    /// Enabled only when `HERMESGATE_VIDEO_STATS` names a CSV file; the
+    /// session thread is the only writer of that file.
+    #[derive(Default)]
+    struct Stats {
+        /// Socket read rounds entered.
+        rounds: AtomicU64,
+        /// H.264 bytes read off the socket.
+        bytes_in: AtomicU64,
+        /// Nanoseconds blocked in the socket read.
+        read_ns: AtomicU64,
+        /// Nanoseconds inside `Decoder::push`/`finish` (decode + NV12→BGRA).
+        decode_ns: AtomicU64,
+        /// Decoder feed calls.
+        decode_calls: AtomicU64,
+        /// Frames handed back by the decoder.
+        decoded: AtomicU64,
+        /// Frames written into the presenter slot.
+        delivered: AtomicU64,
+        /// Frames the presenter took out of the slot (rendered frames).
+        taken: AtomicU64,
+        /// WM_PAINT passes that drew something.
+        painted: AtomicU64,
+        /// Nanoseconds inside the GDI blit.
+        blit_ns: AtomicU64,
+        /// Presenter loop iterations.
+        iters: AtomicU64,
+        /// Presenter iterations that found no fresh frame.
+        empty: AtomicU64,
+        /// Nanoseconds spent in the whole presenter loop body.
+        loop_ns: AtomicU64,
+        /// Nanoseconds inside `paint` from `BeginPaint` to `EndPaint`.
+        paint_ns: AtomicU64,
     }
 
-    impl IMFByteStream_Impl for SocketStream_Impl {
-        fn GetCapabilities(&self) -> WinResult<u32> {
-            // Readable and progressive: never seekable.
-            Ok(MFBYTESTREAM_IS_READABLE)
+    impl Stats {
+        /// `Some` when the CSV path is configured and creatable.
+        fn open() -> Option<(Arc<Stats>, std::fs::File)> {
+            let path = std::env::var_os("HERMESGATE_VIDEO_STATS")?;
+            if path.is_empty() {
+                return None;
+            }
+            let mut file = std::fs::File::create(std::path::PathBuf::from(path)).ok()?;
+            let _ = writeln!(
+                file,
+                "t_s,rounds,bytes_in,bytes_per_s,decode_calls,frames_decoded,fps_decoded,\
+                 frames_delivered,frames_taken,frames_painted,frames_overwritten,\
+                 read_ms,decode_ms,blit_ms,read_pct,decode_pct,iters,empty,loop_ms,paint_ms"
+            );
+            Some((Arc::new(Stats::default()), file))
         }
 
-        fn GetLength(&self) -> WinResult<u64> {
-            Err(E_NOTIMPL.into())
+        fn add(counter: &AtomicU64, value: u64) {
+            counter.fetch_add(value, Ordering::Relaxed);
         }
 
-        fn SetLength(&self, _length: u64) -> WinResult<()> {
-            Err(E_NOTIMPL.into())
+        fn get(counter: &AtomicU64) -> u64 {
+            counter.load(Ordering::Relaxed)
         }
+    }
 
-        fn GetCurrentPosition(&self) -> WinResult<u64> {
-            Ok(self.position.load(Ordering::SeqCst))
-        }
+    // ---------------------------------------------------------------- socket
 
-        fn SetCurrentPosition(&self, _position: u64) -> WinResult<()> {
-            Err(E_NOTIMPL.into())
-        }
+    /// Bytes offered to the decoder per push. The read loop fills this much
+    /// or flushes what it has once the socket goes quiet, so whole access
+    /// units reach the decoder instead of byte-sized fragments.
+    const READ_CHUNK: usize = 32 * 1024;
 
-        fn IsEndOfStream(&self) -> WinResult<BOOL> {
-            Ok(FALSE)
-        }
+    /// How one socket read round ended.
+    enum ReadOutcome {
+        /// `n` bytes are ready for the decoder.
+        Data(usize),
+        /// Nothing arrived before the read tick: the session is still alive.
+        Idle,
+        /// The server closed the stream cleanly.
+        Closed,
+        /// The socket failed (device unplugged, `adb forward` lost).
+        Lost,
+    }
 
-        fn Read(&self, buffer: *mut u8, count: u32, read: *mut u32) -> WinResult<()> {
-            let bytes = unsafe { std::slice::from_raw_parts_mut(buffer, count as usize) };
-            let mut total = 0usize;
-            while total == 0 {
-                if self.control.stop_requested() {
-                    break;
+    /// Read one round off the device socket, ticking every `READ_TICK` so
+    /// Stop and mirror-window close stay responsive while the stream is
+    /// quiet.
+    fn read_round(stream: &TcpStream, chunk: &mut [u8]) -> ReadOutcome {
+        let mut source: &TcpStream = stream;
+        let mut filled = 0usize;
+        loop {
+            if filled == chunk.len() {
+                return ReadOutcome::Data(filled);
+            }
+            match source.read(&mut chunk[filled..]) {
+                // End of stream: hand the partial round over first, so the
+                // tail is decoded rather than dropped.
+                Ok(0) => return ended(filled, ReadOutcome::Closed),
+                Ok(read) => filled += read,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return ended(filled, ReadOutcome::Idle)
                 }
-                match (&*self.stream).read(&mut bytes[total..]) {
-                    Ok(0) => break,
-                    Ok(got) => total += got,
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) => {}
-                    Err(_) => break, // socket lost: Media Foundation sees EOS
-                }
+                Err(_) => return ended(filled, ReadOutcome::Lost),
             }
-            unsafe {
-                *read = total as u32;
-            }
-            if total > 0 {
-                self.position.fetch_add(total as u64, Ordering::SeqCst);
-            }
-            Ok(())
         }
+    }
 
-        fn BeginRead(
-            &self,
-            _buffer: *mut u8,
-            _count: u32,
-            _callback: Ref<'_, IMFAsyncCallback>,
-            _state: Ref<'_, IUnknown>,
-        ) -> WinResult<()> {
-            Err(E_NOTIMPL.into())
-        }
-
-        fn EndRead(&self, _result: Ref<'_, IMFAsyncResult>) -> WinResult<u32> {
-            Err(E_NOTIMPL.into())
-        }
-
-        fn Write(&self, _data: *const u8, _count: u32) -> WinResult<u32> {
-            Err(E_NOTIMPL.into())
-        }
-
-        fn BeginWrite(
-            &self,
-            _data: *const u8,
-            _count: u32,
-            _callback: Ref<'_, IMFAsyncCallback>,
-            _state: Ref<'_, IUnknown>,
-        ) -> WinResult<()> {
-            Err(E_NOTIMPL.into())
-        }
-
-        fn EndWrite(&self, _result: Ref<'_, IMFAsyncResult>) -> WinResult<u32> {
-            Err(E_NOTIMPL.into())
-        }
-
-        fn Seek(
-            &self,
-            _origin: MFBYTESTREAM_SEEK_ORIGIN,
-            _offset: i64,
-            _flags: u32,
-        ) -> WinResult<u64> {
-            Err(E_NOTIMPL.into())
-        }
-
-        fn Flush(&self) -> WinResult<()> {
-            Ok(())
-        }
-
-        fn Close(&self) -> WinResult<()> {
-            Ok(())
+    /// Classify a read round that stopped early: data already read wins over
+    /// the reason it stopped.
+    fn ended(filled: usize, reason: ReadOutcome) -> ReadOutcome {
+        if filled > 0 {
+            ReadOutcome::Data(filled)
+        } else {
+            reason
         }
     }
 
     // -------------------------------------------------------------- decoder
 
-    /// Balances `MFStartup` for one playback session; drops after the reader.
-    struct MfGuard;
+    // Decoding lives in [`crate::core::h264`]. A Media Foundation source
+    // reader cannot open this stream — a containerless Annex-B byte stream
+    // has no byte-stream handler, and the resolver answers `0xC00D36C4` —
+    // while the H.264 decoder MFT consumes it and hands back frames, either
+    // as device textures (when it took the device) or as system-memory BGRA.
 
-    impl Drop for MfGuard {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = MFShutdown();
+    /// The decoder for this session: bound to `device` when there is one, so
+    /// decoded pictures stay on the GPU, and in system memory otherwise. A
+    /// decoder that cannot be built against the device falls back instead of
+    /// failing the session.
+    fn build_decoder(
+        device: &Option<Arc<gpu::Device>>,
+    ) -> Result<Decoder, crate::core::h264::H264Error> {
+        let Some(device) = device else {
+            return Decoder::new();
+        };
+        // Decoding on the device is opt-in until the deadlock below is fixed:
+        // the Media Foundation H.264 decoder accepts the Direct3D 11 device
+        // manager and then never returns from its first `ProcessOutput` (see
+        // `tests/h264_offline.rs`), so the software decoder stays the default.
+        // `HERMESGATE_H264_HW=1` asks for the device path anyway.
+        if std::env::var("HERMESGATE_H264_HW").is_err() {
+            return Decoder::new();
+        }
+        match Decoder::new_hardware(device.clone()) {
+            Ok(decoder) => Ok(decoder),
+            Err(error) => {
+                eprintln!("mirror: decoding on the CPU ({error})");
+                Decoder::new()
             }
         }
-    }
-
-    /// Open the source reader over the socket: raw H.264 in, RGB32 frames
-    /// out, with hardware decode/convert where the platform offers it.
-    fn open(
-        stream: Arc<TcpStream>,
-        control: Arc<PlaybackControl>,
-    ) -> WinResult<(MfGuard, IMFSourceReader)> {
-        unsafe {
-            // Dedicated session thread, so COM initialization cannot clash.
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
-            let guard = MfGuard;
-
-            let mut attributes_ptr: Option<IMFAttributes> = None;
-            MFCreateAttributes(&mut attributes_ptr, 2)?;
-            let attributes = attributes_ptr.ok_or_else(|| {
-                Error::new(E_FAIL, "MFCreateAttributes returned no attribute store")
-            })?;
-            // Hardware transforms = GPU decode where available; advanced
-            // processing = the color conversion the presenter needs.
-            attributes.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
-            attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)?;
-
-            let byte_stream: IMFByteStream = SocketStream {
-                stream,
-                control,
-                position: AtomicU64::new(0),
-            }
-            .into();
-            let reader = MFCreateSourceReaderFromByteStream(&byte_stream, &attributes)?;
-
-            let media_type = MFCreateMediaType()?;
-            media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            media_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
-            reader.SetCurrentMediaType(
-                MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
-                None,
-                &media_type,
-            )?;
-            Ok((guard, reader))
-        }
-    }
-
-    /// Current decoded output geometry: `(width, height, stride)`.
-    fn output_layout(reader: &IMFSourceReader) -> WinResult<(u32, u32, i32)> {
-        unsafe {
-            let media_type =
-                reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)?;
-            // MF_MT_FRAME_SIZE packs width into the high 32 bits, height low.
-            let packed = media_type.GetUINT64(&MF_MT_FRAME_SIZE)?;
-            let width = ((packed >> 32) & 0xFFFF_FFFF) as u32;
-            let height = (packed & 0xFFFF_FFFF) as u32;
-            let stride = media_type
-                .GetUINT32(&MF_MT_DEFAULT_STRIDE)
-                .map(|value| value as i32)
-                .unwrap_or((width * 4) as i32);
-            let stride = if stride == 0 {
-                (width * 4) as i32
-            } else {
-                stride
-            };
-            Ok((width, height, stride))
-        }
-    }
-
-    /// Pull one decoded sample out as a normalized top-down BGRA frame.
-    fn next_frame(reader: &IMFSourceReader, sample: IMFSample) -> WinResult<Frame> {
-        let (width, height, stride) = output_layout(reader)?;
-        unsafe {
-            let buffer = sample.ConvertToContiguousBuffer()?;
-            let mut data = std::ptr::null_mut();
-            let mut max_length = 0u32;
-            let mut current_length = 0u32;
-            buffer.Lock(&mut data, Some(&mut max_length), Some(&mut current_length))?;
-            let frame = normalize(data, current_length, width, height, stride);
-            buffer.Unlock()?;
-            frame
-        }
-    }
-
-    /// Copy the locked buffer into a packed top-down frame. Handles negative
-    /// stride (bottom-up source) and row padding.
-    fn normalize(
-        data: *const u8,
-        length: u32,
-        width: u32,
-        height: u32,
-        stride: i32,
-    ) -> WinResult<Frame> {
-        let row_bytes = width as usize * 4;
-        let length = length as usize;
-        if data.is_null() || width == 0 || height == 0 || length < row_bytes {
-            return Err(Error::new(E_INVALIDARG, "decoder produced an empty frame"));
-        }
-        let mut stride = i64::from(stride);
-        if stride == 0 {
-            stride = row_bytes as i64;
-        }
-        let abs_stride = stride.unsigned_abs() as usize;
-        if length < abs_stride.saturating_mul(height as usize) {
-            if length < row_bytes.saturating_mul(height as usize) {
-                return Err(Error::new(
-                    E_INVALIDARG,
-                    "decoded buffer is smaller than the frame",
-                ));
-            }
-            // Advertised stride disagrees with the buffer: assume packed rows.
-            stride = row_bytes as i64;
-        }
-        let source = unsafe { std::slice::from_raw_parts(data, length) };
-        let mut bgra = vec![0u8; row_bytes * height as usize];
-        for y in 0..height as usize {
-            // Negative stride = bottom-up: the locked buffer starts at the
-            // last display row.
-            let row = if stride >= 0 {
-                y
-            } else {
-                height as usize - 1 - y
-            };
-            let offset = row * abs_stride;
-            if offset + row_bytes > source.len() {
-                break; // defensive: never read past the locked buffer
-            }
-            bgra[y * row_bytes..(y + 1) * row_bytes]
-                .copy_from_slice(&source[offset..offset + row_bytes]);
-        }
-        Ok(Frame {
-            width,
-            height,
-            bgra,
-        })
     }
 
     // ------------------------------------------------------------- presenter
@@ -392,11 +291,13 @@ mod native {
             control: Arc<PlaybackControl>,
             title: &str,
             size: (u32, u32),
+            device: Option<Arc<gpu::Device>>,
+            stats: Option<Arc<Stats>>,
         ) -> Result<Presenter, String> {
             let title = title.to_string();
             std::thread::Builder::new()
                 .name("mirror-window".to_string())
-                .spawn(move || window_loop(slot, control, &title, size))
+                .spawn(move || window_loop(slot, control, &title, size, device, stats))
                 .map(|thread| Presenter { thread })
                 .map_err(|error| format!("cannot start mirror window: {error}"))
         }
@@ -406,10 +307,143 @@ mod native {
         }
     }
 
+    /// Hand one decoded frame to the mirror window: the first frame spawns
+    /// it, and a changed geometry (device rotation) republishes the size.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver(
+        frame: Frame,
+        slot: &Arc<Mutex<Option<Frame>>>,
+        presenter: &mut Option<Presenter>,
+        size: &mut Option<(u32, u32)>,
+        device: &Option<Arc<gpu::Device>>,
+        control: &Arc<PlaybackControl>,
+        title: &str,
+        stats: &Option<Arc<Stats>>,
+        on_size: &mut impl FnMut(u32, u32),
+    ) -> Result<(), String> {
+        let frame_size = frame.size();
+        if *size != Some(frame_size) {
+            *size = Some(frame_size);
+            on_size(frame_size.0, frame_size.1);
+            if presenter.is_none() {
+                *presenter = Some(Presenter::spawn(
+                    slot.clone(),
+                    control.clone(),
+                    title,
+                    frame_size,
+                    device.clone(),
+                    stats.clone(),
+                )?);
+            }
+        }
+        if let Ok(mut latest) = slot.lock() {
+            *latest = Some(frame);
+        }
+        if let Some(stats) = stats {
+            Stats::add(&stats.delivered, 1);
+        }
+        Ok(())
+    }
+
     /// Per-window thread state, accessed from the window procedure.
     struct WindowState {
         control: Option<Arc<PlaybackControl>>,
+        /// The newest frame for `WM_PAINT`; only used while the window draws
+        /// with GDI.
         latest: Option<Frame>,
+        /// A client area the user resized the window to, waiting for the
+        /// window thread to resize the swap chain.
+        resize: Option<(u32, u32)>,
+        /// TEMPORARY diagnostics (see [`Stats`]).
+        stats: Option<Arc<Stats>>,
+    }
+
+    /// How the mirror window shows frames.
+    ///
+    /// With a Direct3D device the window presents through a DXGI swap chain,
+    /// which the GPU fills from a decoded texture directly. Without one — or
+    /// after presenting fails — the window draws with GDI and frames have to
+    /// be in system memory.
+    struct Presentation {
+        device: Option<Arc<gpu::Device>>,
+        presenter: Option<gpu::Presenter>,
+    }
+
+    impl Presentation {
+        /// Build the presentation for a window and a picture geometry.
+        fn new(device: Option<Arc<gpu::Device>>, hwnd: HWND, geometry: (u32, u32)) -> Self {
+            let presenter = device.as_ref().and_then(|device| {
+                match gpu::Presenter::new(device.clone(), hwnd, client_size(hwnd), geometry) {
+                    Ok(presenter) => Some(presenter),
+                    Err(error) => {
+                        eprintln!("mirror: drawing with GDI, no GPU presentation: {error}");
+                        None
+                    }
+                }
+            });
+            Self { device, presenter }
+        }
+
+        /// Show one frame.
+        ///
+        /// `None` means the window presented it; `Some(frame)` means there is
+        /// no GPU presentation and the frame belongs to `WM_PAINT` instead.
+        fn show(&mut self, frame: Frame) -> Option<Frame> {
+            if let Some(presenter) = self.presenter.as_mut() {
+                let shown = match &frame {
+                    Frame::Texture { texture, .. } => {
+                        presenter.present(&texture.texture, texture.subresource)
+                    }
+                    Frame::Bgra {
+                        width,
+                        height,
+                        bgra,
+                        ..
+                    } => presenter.present_bgra(bgra, (*width, *height)),
+                };
+                match shown {
+                    Ok(()) => return None,
+                    Err(error) => {
+                        // A swap chain that failed on this window has to go:
+                        // it owns the window's pixels while it exists.
+                        eprintln!("mirror: GPU presentation failed, drawing with GDI: {error}");
+                        self.presenter = None;
+                    }
+                }
+            }
+            match frame {
+                Frame::Bgra { .. } => Some(frame),
+                Frame::Texture {
+                    texture,
+                    coded,
+                    visible,
+                } => {
+                    // GDI draws from system memory, so a decoded texture is
+                    // read back on the way to the window.
+                    let device = self.device.as_ref()?;
+                    match device.read_bgra(&texture.texture, texture.subresource, coded, visible) {
+                        Ok(bgra) => Some(Frame::Bgra {
+                            width: visible.0,
+                            height: visible.1,
+                            stride: visible.0 * 4,
+                            bgra,
+                        }),
+                        Err(error) => {
+                            eprintln!("mirror: reading a decoded picture back failed: {error}");
+                            None
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Follow a client area change.
+        fn resize(&mut self, client: (u32, u32)) -> Result<(), String> {
+            match self.presenter.as_mut() {
+                Some(presenter) => presenter.resize(client),
+                None => Ok(()),
+            }
+        }
     }
 
     thread_local! {
@@ -421,11 +455,15 @@ mod native {
         control: Arc<PlaybackControl>,
         title: &str,
         initial_size: (u32, u32),
+        device: Option<Arc<gpu::Device>>,
+        stats: Option<Arc<Stats>>,
     ) {
         STATE.with(|state| {
             *state.borrow_mut() = Some(WindowState {
                 control: Some(control.clone()),
                 latest: None,
+                resize: None,
+                stats: stats.clone(),
             });
         });
 
@@ -446,8 +484,22 @@ mod native {
             }
         };
 
+        // A window is created hidden: without this the session runs with no
+        // visible mirror at all.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = UpdateWindow(hwnd);
+        }
+
+        // The swap chain is built once the window exists: it is sized from
+        // the window's client area, which only the window itself knows.
+        let mut presentation = Presentation::new(device.clone(), hwnd, initial_size);
         let mut size = initial_size;
         'outer: loop {
+            let iteration = Instant::now();
+            if let Some(stats) = &stats {
+                Stats::add(&stats.iters, 1);
+            }
             let mut message = MSG::default();
             while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
                 if message.message == WM_QUIT {
@@ -464,24 +516,95 @@ mod native {
             if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
                 break;
             }
+            // The user may have resized the window: the swap chain follows.
+            let resized = STATE.with(|state| {
+                state
+                    .borrow_mut()
+                    .as_mut()
+                    .and_then(|window| window.resize.take())
+            });
+            if let Some(client) = resized {
+                if let Err(error) = presentation.resize(client) {
+                    eprintln!("mirror: resizing the GPU presentation failed: {error}");
+                }
+            }
             let fresh = slot.lock().map(|mut frame| frame.take()).unwrap_or(None);
             if let Some(frame) = fresh {
-                if (frame.width, frame.height) != size {
-                    size = (frame.width, frame.height);
-                    resize_client(hwnd, size);
+                if let Some(stats) = &stats {
+                    Stats::add(&stats.taken, 1);
                 }
-                STATE.with(|state| {
-                    if let Some(window) = state.borrow_mut().as_mut() {
-                        window.latest = Some(frame);
-                    }
-                });
-                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                // A rotated stream gets a new window size and a fresh swap
+                // chain: surfaces and video processor are sized for the
+                // picture they were built for.
+                let frame_size = frame.size();
+                if frame_size != size {
+                    size = frame_size;
+                    resize_client(hwnd, size);
+                    presentation = Presentation::new(device.clone(), hwnd, size);
+                }
+                let started = Instant::now();
+                if let Some(frame) = presentation.show(frame) {
+                    STATE.with(|state| {
+                        if let Some(window) = state.borrow_mut().as_mut() {
+                            window.latest = Some(frame);
+                        }
+                    });
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                }
+                if let Some(stats) = &stats {
+                    Stats::add(&stats.blit_ns, started.elapsed().as_nanos() as u64);
+                }
             } else {
+                if let Some(stats) = &stats {
+                    Stats::add(&stats.empty, 1);
+                }
                 std::thread::sleep(Duration::from_millis(6));
+            }
+            if let Some(stats) = &stats {
+                Stats::add(&stats.loop_ns, iteration.elapsed().as_nanos() as u64);
             }
         }
 
         STATE.with(|state| *state.borrow_mut() = None);
+    }
+
+    /// The window's client area in pixels.
+    fn client_size(hwnd: HWND) -> (u32, u32) {
+        let mut client = RECT::default();
+        if unsafe { GetClientRect(hwnd, &mut client) }.is_err() {
+            return (1, 1);
+        }
+        (
+            (client.right - client.left).max(1) as u32,
+            (client.bottom - client.top).max(1) as u32,
+        )
+    }
+
+    /// Desktop size in pixels (`SM_CXSCREEN`, `SM_CYSCREEN`).
+    fn screen() -> (i32, i32) {
+        let width = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(320);
+        let height = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(240);
+        (width, height)
+    }
+
+    /// Largest client area that still leaves the mirror window usable,
+    /// keeping the frame's aspect ratio. A tall phone stream (720x1604) is
+    /// scaled down instead of being clamped off the bottom of a 1080p
+    /// desktop; the blit stretches it back to whatever client area results.
+    fn fit_to_screen(size: (u32, u32)) -> (u32, u32) {
+        let (frame_w, frame_h) = (size.0.max(1), size.1.max(1));
+        let (screen_w, screen_h) = screen();
+        // Leave room for the title bar and the taskbar.
+        let max_w = (screen_w as u32 * 9 / 10).max(320);
+        let max_h = (screen_h as u32 * 85 / 100).max(240);
+        if frame_w <= max_w && frame_h <= max_h {
+            return (frame_w, frame_h);
+        }
+        let scale = f64::min(max_w as f64 / frame_w as f64, max_h as f64 / frame_h as f64);
+        (
+            ((frame_w as f64 * scale).round() as u32).max(1),
+            ((frame_h as f64 * scale).round() as u32).max(1),
+        )
     }
 
     fn register_class(hinstance: HINSTANCE) {
@@ -508,6 +631,7 @@ mod native {
     }
 
     fn create_window(hinstance: HINSTANCE, title: &str, size: (u32, u32)) -> Option<HWND> {
+        let size = fit_to_screen(size);
         let mut rect = RECT {
             left: 0,
             top: 0,
@@ -517,16 +641,23 @@ mod native {
         let _ = unsafe {
             AdjustWindowRectEx(&mut rect, WS_OVERLAPPEDWINDOW, false, WINDOW_EX_STYLE(0))
         };
+        let window_w = rect.right - rect.left;
+        let window_h = rect.bottom - rect.top;
+        // Centre it: a default position can put a tall window's lower half
+        // off the bottom of the desktop.
+        let (screen_w, screen_h) = screen();
+        let x = ((screen_w - window_w) / 2).max(0);
+        let y = ((screen_h - window_h) / 2).max(0);
         let created = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 CLASS_NAME,
                 &HSTRING::from(title),
                 WS_OVERLAPPEDWINDOW,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
+                x,
+                y,
+                window_w,
+                window_h,
                 None,
                 None,
                 Some(hinstance),
@@ -537,6 +668,7 @@ mod native {
     }
 
     fn resize_client(hwnd: HWND, size: (u32, u32)) {
+        let size = fit_to_screen(size);
         let mut rect = RECT {
             left: 0,
             top: 0,
@@ -571,6 +703,23 @@ mod native {
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1), // painted in WM_PAINT — no flicker
+            WM_SIZE => {
+                // Recorded for the window thread: a swap chain cannot resize
+                // itself from inside a message.
+                let mut client = RECT::default();
+                if unsafe { GetClientRect(hwnd, &mut client) }.is_ok() {
+                    let size = (
+                        (client.right - client.left).max(1) as u32,
+                        (client.bottom - client.top).max(1) as u32,
+                    );
+                    STATE.with(|state| {
+                        if let Some(window) = state.borrow_mut().as_mut() {
+                            window.resize = Some(size);
+                        }
+                    });
+                }
+                LRESULT(0)
+            }
             WM_CLOSE => {
                 // User-initiated close: classify the session end as clean.
                 STATE.with(|state| {
@@ -595,6 +744,7 @@ mod native {
     }
 
     fn paint(hwnd: HWND) {
+        let entered = Instant::now();
         let mut paint_struct = PAINTSTRUCT::default();
         let hdc = unsafe { BeginPaint(hwnd, &mut paint_struct) };
         let mut client = RECT::default();
@@ -602,25 +752,53 @@ mod native {
         STATE.with(|state| {
             if let Some(window) = state.borrow().as_ref() {
                 if let Some(frame) = window.latest.as_ref() {
+                    let started = Instant::now();
                     blit(hdc, frame, &client);
+                    if let Some(stats) = &window.stats {
+                        Stats::add(&stats.painted, 1);
+                        Stats::add(&stats.blit_ns, started.elapsed().as_nanos() as u64);
+                    }
                 }
             }
         });
         let _ = unsafe { EndPaint(hwnd, &paint_struct) };
+        STATE.with(|state| {
+            if let Some(window) = state.borrow().as_ref() {
+                if let Some(stats) = &window.stats {
+                    Stats::add(&stats.paint_ns, entered.elapsed().as_nanos() as u64);
+                }
+            }
+        });
     }
 
     /// Draw the frame stretched into the client area (top-down BGRA → DIB).
+    ///
+    /// Only system-memory frames reach here: a device texture is read back by
+    /// [`Presentation::show`] before it is handed to `WM_PAINT`.
     fn blit(hdc: HDC, frame: &Frame, client: &RECT) {
+        let Frame::Bgra {
+            width,
+            height,
+            stride,
+            bgra,
+        } = frame
+        else {
+            return;
+        };
+        let (width, height, stride) = (*width, *height, *stride);
         let dest_w = client.right - client.left;
         let dest_h = client.bottom - client.top;
         if dest_w <= 0 || dest_h <= 0 {
             return;
         }
+        // The DIB describes the rows as they are laid out, padding included;
+        // the source rectangle picks the visible columns out of them.
+        let row_bytes = (stride / 4 * 4).max(width * 4);
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: frame.width as i32,
-                biHeight: -(frame.height as i32), // negative = top-down
+                biWidth: (row_bytes / 4) as i32,
+                biHeight: -(height as i32), // negative = top-down
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: BI_RGB.0,
@@ -641,9 +819,9 @@ mod native {
                 dest_h,
                 0,
                 0,
-                frame.width as i32,
-                frame.height as i32,
-                Some(frame.bgra.as_ptr().cast()),
+                width as i32,
+                height as i32,
+                Some(bgra.as_ptr().cast()),
                 &info,
                 DIB_RGB_COLORS,
                 SRCCOPY,
@@ -680,13 +858,47 @@ mod native {
         title: &str,
         mut on_size: impl FnMut(u32, u32),
     ) -> StreamEnd {
-        // The byte stream must tick instead of blocking forever, otherwise
-        // Stop would wait for the next video packet.
+        // The socket must tick instead of blocking forever, otherwise Stop
+        // would wait for the next video packet.
         let _ = stream.set_read_timeout(Some(READ_TICK));
         let _ = stream.set_nodelay(true);
 
-        let (guard, reader) = match open(stream, control.clone()) {
-            Ok(opened) => opened,
+        // One Direct3D 11 device for the whole pipeline: the decoder writes
+        // pictures into its textures, the mirror window presents them through
+        // its swap chain. A software rasteriser is no better than the CPU
+        // path, so it is not used at all.
+        // The Direct3D 11 path is opt-in: it feeds the decoder from the device
+        // and presents through a swap chain, but device decoding deadlocks
+        // inside Media Foundation on this stack (see `docs/adr/0003`), so the
+        // default pipeline stays on the verified software decoder plus the GDI
+        // presenter. `HERMESGATE_VIDEO_GPU=1` builds the device path.
+        let device = if std::env::var("HERMESGATE_VIDEO_GPU").is_err() {
+            None
+        } else {
+            match gpu::Device::new() {
+                Ok(device) if device.is_hardware() => {
+                    eprintln!(
+                        "mirror: {} for GPU decode and presentation",
+                        device.adapter()
+                    );
+                    Some(Arc::new(device))
+                }
+                Ok(device) => {
+                    eprintln!(
+                        "mirror: decoding and drawing on the CPU (no hardware Direct3D adapter, {} is software)",
+                        device.adapter()
+                    );
+                    None
+                }
+                Err(error) => {
+                    eprintln!("mirror: decoding and drawing on the CPU ({error})");
+                    None
+                }
+            }
+        };
+
+        let mut decoder = match build_decoder(&device) {
+            Ok(decoder) => decoder,
             Err(error) => {
                 return StreamEnd::Failed(format!("video decoder init failed: {error}"));
             }
@@ -695,73 +907,165 @@ mod native {
         let slot: Arc<Mutex<Option<Frame>>> = Arc::new(Mutex::new(None));
         let mut presenter: Option<Presenter> = None;
         let mut size: Option<(u32, u32)> = None;
+        let mut chunk = vec![0u8; READ_CHUNK];
+
+        // TEMPORARY measurement state (see [`Stats`]).
+        let (stats, mut csv) = match Stats::open() {
+            Some((stats, file)) => (Some(stats), Some(file)),
+            None => (None, None),
+        };
+        let started = Instant::now();
+        // The decoder only knows which stage it decoded on once it has seen
+        // the stream, so the pipeline reports it on the first frame.
+        let mut logged_mode = false;
+        let mut window = Instant::now();
+        let mut prev = [0u64; 14]; // rounds, bytes, calls, decoded, delivered, taken, painted, read_ns, decode_ns, blit_ns, iters, empty, loop_ns, paint_ns
+
         let end;
         loop {
             if control.stop_requested() {
                 end = control_end(&control);
                 break;
             }
-            let mut flags = 0u32;
-            let mut timestamp = 0i64;
-            let mut sample: Option<IMFSample> = None;
-            let read = unsafe {
-                reader.ReadSample(
-                    MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
-                    0,
-                    None,
-                    Some(&mut flags),
-                    Some(&mut timestamp),
-                    Some(&mut sample),
-                )
+
+            let read_start = Instant::now();
+            let outcome = read_round(&stream, &mut chunk);
+            if let Some(stats) = &stats {
+                Stats::add(&stats.read_ns, read_start.elapsed().as_nanos() as u64);
+                Stats::add(&stats.rounds, 1);
+            }
+            let (filled, last) = match outcome {
+                ReadOutcome::Data(filled) => {
+                    if let Some(stats) = &stats {
+                        Stats::add(&stats.bytes_in, filled as u64);
+                    }
+                    (filled, false)
+                }
+                ReadOutcome::Idle => continue, // nothing yet: re-check Stop
+                ReadOutcome::Closed => (0, true),
+                ReadOutcome::Lost => (0, true),
             };
-            if let Err(error) = read {
-                end = or_failure(&control, format!("video decoder failed: {error}"));
-                break;
-            }
-            if flags & (MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
-                end = control_end(&control);
-                break;
-            }
-            if flags & (MF_SOURCE_READERF_ERROR.0 as u32) != 0 {
-                end = or_failure(&control, "video decoder reported an error".to_string());
-                break;
-            }
-            let Some(sample) = sample else {
-                continue;
+
+            // The final round drains the decoder: the bytes already off the
+            // wire may complete a frame it is still holding.
+            let decode_start = Instant::now();
+            let decoded = if last {
+                decoder.finish()
+            } else {
+                decoder.push(&chunk[..filled])
             };
-            let frame = match next_frame(&reader, sample) {
-                Ok(frame) => frame,
+            if let Some(stats) = &stats {
+                Stats::add(&stats.decode_ns, decode_start.elapsed().as_nanos() as u64);
+                Stats::add(&stats.decode_calls, 1);
+            }
+            let frames = match decoded {
+                Ok(frames) => frames,
                 Err(error) => {
-                    end = or_failure(&control, format!("frame conversion failed: {error}"));
+                    end = or_failure(&control, format!("video decode failed: {error}"));
                     break;
                 }
             };
-            let frame_size = (frame.width, frame.height);
-            if size != Some(frame_size) {
-                size = Some(frame_size);
-                on_size(frame.width, frame.height);
-                if presenter.is_none() {
-                    match Presenter::spawn(slot.clone(), control.clone(), title, frame_size) {
-                        Ok(spawned) => presenter = Some(spawned),
-                        Err(error) => {
-                            end = StreamEnd::Failed(error);
-                            break;
-                        }
-                    }
+
+            if !logged_mode {
+                logged_mode = true;
+                let stage = if decoder.is_hardware() {
+                    "on the GPU"
+                } else {
+                    "on the CPU"
+                };
+                eprintln!("mirror: H.264 decoding {stage}");
+            }
+
+            let mut failure = None;
+            for frame in frames {
+                if let Some(stats) = &stats {
+                    Stats::add(&stats.decoded, 1);
+                }
+                if let Err(error) = deliver(
+                    frame,
+                    &slot,
+                    &mut presenter,
+                    &mut size,
+                    &device,
+                    &control,
+                    title,
+                    &stats,
+                    &mut on_size,
+                ) {
+                    failure = Some(error);
+                    break;
                 }
             }
-            if let Ok(mut latest) = slot.lock() {
-                *latest = Some(frame);
+            if let Some(error) = failure {
+                end = StreamEnd::Failed(error);
+                break;
+            }
+
+            // TEMPORARY: one CSV row per second, deltas over that second.
+            if let (Some(stats), Some(file)) = (&stats, csv.as_mut()) {
+                let elapsed = window.elapsed();
+                if elapsed >= Duration::from_secs(1) {
+                    let secs = elapsed.as_secs_f64();
+                    let now = [
+                        Stats::get(&stats.rounds),
+                        Stats::get(&stats.bytes_in),
+                        Stats::get(&stats.decode_calls),
+                        Stats::get(&stats.decoded),
+                        Stats::get(&stats.delivered),
+                        Stats::get(&stats.taken),
+                        Stats::get(&stats.painted),
+                        Stats::get(&stats.read_ns),
+                        Stats::get(&stats.decode_ns),
+                        Stats::get(&stats.blit_ns),
+                        Stats::get(&stats.iters),
+                        Stats::get(&stats.empty),
+                        Stats::get(&stats.loop_ns),
+                        Stats::get(&stats.paint_ns),
+                    ];
+                    let delta = |index: usize| now[index].saturating_sub(prev[index]);
+                    let _ = writeln!(
+                        file,
+                        "{:.1},{},{},{:.0},{},{},{:.1},{},{},{},{},{:.1},{:.1},{:.1},{:.0},{:.0},\
+                         {},{},{:.1},{:.1}",
+                        started.elapsed().as_secs_f64(),
+                        now[0],
+                        now[1],
+                        delta(1) as f64 / secs,
+                        now[2],
+                        now[3],
+                        delta(3) as f64 / secs,
+                        now[4],
+                        now[5],
+                        now[6],
+                        delta(4).saturating_sub(delta(5)),
+                        delta(7) as f64 / 1e6,
+                        delta(8) as f64 / 1e6,
+                        delta(9) as f64 / 1e6,
+                        delta(7) as f64 / (secs * 1e9) * 100.0,
+                        delta(8) as f64 / (secs * 1e9) * 100.0,
+                        delta(10),
+                        delta(11),
+                        delta(12) as f64 / 1e6,
+                        delta(13) as f64 / 1e6
+                    );
+                    let _ = file.flush();
+                    prev = now;
+                    window = Instant::now();
+                }
+            }
+
+            if last {
+                end = control_end(&control);
+                break;
             }
         }
 
-        // Teardown order: window first, then reader, then MFShutdown.
+        // Teardown order: window first, then the decoder (which shuts Media
+        // Foundation down).
         control.stop.store(true, Ordering::SeqCst);
         if let Some(presenter) = presenter {
             presenter.join();
         }
-        drop(reader);
-        drop(guard);
         end
     }
 }

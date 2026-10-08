@@ -46,6 +46,20 @@ export interface DeviceSnapshot {
 }
 
 /**
+ * Live state of the mirroring session. `phase: "running"` means the engine
+ * has presented its first frame; `width`/`height` stay at 0 until then.
+ * `reason` carries the failure text when `phase` is `failed`.
+ */
+export interface MirrorStatus {
+  running: boolean;
+  phase: "idle" | "starting" | "running" | "stopped" | "failed";
+  reason: string;
+  width: number;
+  height: number;
+  serial: string;
+}
+
+/**
  * Typed wrappers over the Tauri command layer.
  *
  * The webview can only reach the native core through these commands — no
@@ -65,4 +79,18 @@ export const devices = {
   list: () => invoke<DeviceSnapshot>("list_devices"),
   onChanged: (handler: (snapshot: DeviceSnapshot) => void) =>
     listen<DeviceSnapshot>("devices-changed", (event) => handler(event.payload)),
+};
+
+/**
+ * Mirroring lives entirely on the native side: `start` and `stop` drive the
+ * engine for one device serial, `status` reads the current session on demand,
+ * and `onChanged` streams the `mirror-changed` event the engine emits on
+ * every transition. `start`/`stop` reject with a plain message on failure.
+ */
+export const mirror = {
+  start: (serial: string) => invoke<void>("start_mirror", { serial }),
+  stop: () => invoke<void>("stop_mirror"),
+  status: () => invoke<MirrorStatus>("mirror_status"),
+  onChanged: (handler: (status: MirrorStatus) => void) =>
+    listen<MirrorStatus>("mirror-changed", (event) => handler(event.payload)),
 };

@@ -310,3 +310,82 @@ code {
   font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
   font-size: 12px;
 }
+
+/* ---------- Mirroring ---------- */
+
+.device-row {
+  cursor: pointer;
+}
+
+.device-row:hover:not(.is-disabled) td {
+  background: #f7f9fc;
+}
+
+.device-row.is-selected td {
+  background: var(--accent-soft);
+}
+
+.device-row.is-disabled {
+  cursor: default;
+}
+
+.device-row.is-disabled td {
+  color: #9aa1ac;
+}
+
+.mirror-hint {
+  margin: 0;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border);
+}
+
+.mirror-body {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px 16px;
+}
+
+.mirror-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.mirror-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.btn {
+  padding: 7px 14px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) {
+  background: #f0f2f5;
+}
+
+.btn:disabled {
+  color: #9aa1ac;
+  cursor: default;
+}
+
+.btn-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #ffffff;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #1d4ed8;
+}

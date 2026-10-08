@@ -26,8 +26,12 @@ pub mod adb;
 pub mod clipboard;
 pub mod connection;
 pub mod device;
+#[cfg(windows)]
+pub mod gpu;
+pub mod h264;
 pub mod input;
 pub mod mirroring;
+pub mod pixels;
 pub mod settings;
 pub mod video;
 

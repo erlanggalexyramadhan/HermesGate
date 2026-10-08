@@ -13,7 +13,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_app_info,
             commands::get_core_status,
-            commands::list_devices
+            commands::list_devices,
+            commands::start_mirror,
+            commands::stop_mirror,
+            commands::mirror_status
         ])
         .setup(|app| {
             use tauri::Manager;
@@ -24,6 +27,7 @@ pub fn run() {
                 std::sync::Arc::new(std::sync::Mutex::new(core::device::DeviceManager::new()));
             app.manage(manager.clone());
             commands::watch_devices(app.handle().clone(), manager);
+            commands::watch_mirror(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())

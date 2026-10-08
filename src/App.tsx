@@ -2,9 +2,11 @@ import { useEffect, useState } from "react";
 import {
   core,
   devices,
+  mirror,
   type AppInfo,
   type ModuleInfo,
   type DeviceSnapshot,
+  type MirrorStatus,
 } from "./lib/tauri";
 import "./App.css";
 
@@ -13,7 +15,7 @@ type View = "dashboard" | "devices" | "mirroring" | "settings";
 const NAV: { id: View; label: string; ready: boolean }[] = [
   { id: "dashboard", label: "Dashboard", ready: true },
   { id: "devices", label: "Devices", ready: true },
-  { id: "mirroring", label: "Mirroring", ready: false },
+  { id: "mirroring", label: "Mirroring", ready: true },
   { id: "settings", label: "Settings", ready: false },
 ];
 
@@ -153,6 +155,7 @@ function App() {
           )}
 
           {view === "devices" && <DevicesPanel />}
+          {view === "mirroring" && <MirroringPanel />}
         </div>
       </main>
     </div>
@@ -260,6 +263,198 @@ function DevicesPanel() {
             )}
           </tbody>
         </table>
+      </section>
+    </>
+  );
+}
+
+/**
+ * Mirroring view. The engine itself is native: `start`/`stop` drive one
+ * session for a selected device and the core pushes `mirror-changed` on
+ * every transition. This component only lists usable devices, forwards the
+ * commands, and renders the live status.
+ */
+function MirroringPanel() {
+  const [snapshot, setSnapshot] = useState<DeviceSnapshot | null>(null);
+  const [status, setStatus] = useState<MirrorStatus | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [deviceError, setDeviceError] = useState<string | null>(null);
+  const [mirrorError, setMirrorError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    devices
+      .list()
+      .then((next) => {
+        if (alive) setSnapshot(next);
+      })
+      .catch((err) => {
+        if (alive) setDeviceError(String(err));
+      });
+    mirror
+      .status()
+      .then((next) => {
+        if (alive) setStatus(next);
+      })
+      .catch((err) => {
+        if (alive) setMirrorError(String(err));
+      });
+    const unlistenDevices = devices.onChanged((next) => {
+      if (alive) setSnapshot(next);
+    });
+    const unlistenMirror = mirror.onChanged((next) => {
+      if (alive) setStatus(next);
+    });
+    return () => {
+      alive = false;
+      unlistenDevices.then((off) => off());
+      unlistenMirror.then((off) => off());
+    };
+  }, []);
+
+  const list = snapshot?.devices ?? [];
+  // Only a device in state "online" (adb reported `device`) can be mirrored;
+  // deriving the target here drops the selection the moment it stops being one.
+  const target =
+    list.find((device) => device.serial === selected && device.state === "online") ?? null;
+  const running = status?.running === true;
+  const busy = running || status?.phase === "starting";
+
+  const start = async () => {
+    if (!target) return;
+    setMirrorError(null);
+    try {
+      await mirror.start(target.serial);
+    } catch (err) {
+      setMirrorError(String(err));
+    }
+  };
+
+  const stop = async () => {
+    setMirrorError(null);
+    try {
+      await mirror.stop();
+    } catch (err) {
+      setMirrorError(String(err));
+    }
+  };
+
+  return (
+    <>
+      {deviceError && (
+        <div className="banner">
+          Device service unavailable — the native core did not answer.
+          <div className="banner-detail">{deviceError}</div>
+        </div>
+      )}
+
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Select a device</h2>
+          <span className="chip">
+            {snapshot ? `${list.length} attached` : "reading…"}
+          </span>
+        </div>
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Device</th>
+              <th>Model</th>
+              <th>Transport</th>
+              <th className="col-state">State</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!snapshot ? (
+              <tr>
+                <td className="muted" colSpan={4}>
+                  Reading devices…
+                </td>
+              </tr>
+            ) : list.length === 0 ? (
+              <tr>
+                <td className="muted" colSpan={4}>
+                  No Android devices attached — connect one over USB and allow USB debugging.
+                </td>
+              </tr>
+            ) : (
+              list.map((device) => {
+                const usable = device.state === "online";
+                const isTarget = target?.serial === device.serial;
+                return (
+                  <tr
+                    key={device.serial}
+                    className={`device-row${isTarget ? " is-selected" : ""}${
+                      usable ? "" : " is-disabled"
+                    }`}
+                    aria-selected={isTarget}
+                    onClick={usable ? () => setSelected(device.serial) : undefined}
+                  >
+                    <td>
+                      {device.serial}
+                      {device.manufacturer && <p className="muted">{device.manufacturer}</p>}
+                    </td>
+                    <td className="muted">{device.model ?? "—"}</td>
+                    <td className="muted">{device.transport}</td>
+                    <td className="col-state">
+                      <span className="state">{device.state}</span>
+                    </td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+        {snapshot && list.some((device) => device.state !== "online") && (
+          <p className="muted mirror-hint">
+            Only devices in the <code>online</code> state (USB debugging allowed) can be mirrored.
+          </p>
+        )}
+      </section>
+
+      {mirrorError && (
+        <div className="banner">
+          Mirroring command failed.
+          <div className="banner-detail">{mirrorError}</div>
+        </div>
+      )}
+
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Mirror session</h2>
+          <span className="chip">{status ? status.phase : "unknown"}</span>
+        </div>
+        <div className="mirror-body">
+          <div className="mirror-status">
+            {!status ? (
+              <span className="muted">Reading mirror status…</span>
+            ) : (
+              <>
+                <span className="state">{status.phase}</span>
+                {status.reason && <span className="muted">{status.reason}</span>}
+                {status.width > 0 && status.height > 0 && (
+                  <span className="muted">
+                    {status.width} × {status.height} px
+                  </span>
+                )}
+                {status.serial && <span className="muted">{status.serial}</span>}
+              </>
+            )}
+          </div>
+          <div className="mirror-actions">
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={!target || busy}
+              onClick={start}
+            >
+              Start Mirror
+            </button>
+            <button type="button" className="btn" disabled={!running} onClick={stop}>
+              Stop Mirror
+            </button>
+          </div>
+        </div>
       </section>
     </>
   );
