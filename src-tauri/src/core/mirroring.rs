@@ -134,10 +134,7 @@ impl Session {
         let launched = (|| -> Result<Child, String> {
             // Official scrcpy server, pushed once per start.
             let jar_path = jar.to_string_lossy().into_owned();
-            adb::run(
-                &adb.path,
-                &["-s", serial, "push", &jar_path, REMOTE_JAR],
-            )?;
+            adb::run(&adb.path, &["-s", serial, "push", &jar_path, REMOTE_JAR])?;
             // Replace any leftover server from a previous session.
             let _ = adb::run(
                 &adb.path,
@@ -146,7 +143,10 @@ impl Session {
             // One loopback forward for the video socket. Transport seam: a
             // future Wi-Fi transport replaces this setup, not the pipeline.
             let _ = adb::run(&adb.path, &["--remove-forward", &forward_arg]);
-            adb::run(&adb.path, &["-s", serial, "forward", &forward_arg, &socket_arg])?;
+            adb::run(
+                &adb.path,
+                &["-s", serial, "forward", &forward_arg, &socket_arg],
+            )?;
             // Session-lifetime server process; killed on stop or teardown.
             let args = server_args(serial, quality);
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -186,7 +186,7 @@ impl Session {
             .spawn(move || {
                 // Decodes and presents until the session ends; `on_size`
                 // publishes the first frame — that is when it is "running".
-                let end = video::play(stream, thread_control, &title, |width, height| {
+                let end = video::play(stream.into(), thread_control, &title, |width, height| {
                     if let Ok(mut guard) = thread_status.lock() {
                         guard.width = width;
                         guard.height = height;
@@ -195,13 +195,17 @@ impl Session {
                     }
                 });
                 // Release the transport whatever ended the stream.
-                let _ = adb::run(&adb_path, &["--remove-forward", &format!("tcp:{FORWARD_PORT}")]);
+                let _ = adb::run(
+                    &adb_path,
+                    &["--remove-forward", &format!("tcp:{FORWARD_PORT}")],
+                );
                 let (phase, reason) = match end {
                     StreamEnd::Stopped => ("stopped", String::new()),
                     StreamEnd::UserClosed => ("stopped", "mirror window closed".to_string()),
-                    StreamEnd::Disconnected => {
-                        ("failed", "device disconnected or the stream ended".to_string())
-                    }
+                    StreamEnd::Disconnected => (
+                        "failed",
+                        "device disconnected or the stream ended".to_string(),
+                    ),
                     StreamEnd::Failed(message) => ("failed", message),
                 };
                 if let Ok(mut guard) = thread_status.lock() {
@@ -241,7 +245,10 @@ impl Session {
                 &adb.path,
                 &["-s", &self.serial, "shell", "pkill", "-f", SERVER_CLASS],
             );
-            let _ = adb::run(&adb.path, &["--remove-forward", &format!("tcp:{FORWARD_PORT}")]);
+            let _ = adb::run(
+                &adb.path,
+                &["--remove-forward", &format!("tcp:{FORWARD_PORT}")],
+            );
         }
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -271,7 +278,9 @@ impl Drop for Session {
 static ACTIVE: Mutex<Option<Session>> = Mutex::new(None);
 
 fn active() -> std::sync::MutexGuard<'static, Option<Session>> {
-    ACTIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    ACTIVE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Start mirroring `serial`. Fails when a session is already running or any
@@ -284,7 +293,9 @@ pub fn request_start(serial: &str, quality: MirrorQuality) -> Result<(), String>
         }
         // Retire the finished session before replacing it (its cleanup must
         // not race the new server on the same device).
-        active.take().map(|mut stale| stale.shutdown());
+        if let Some(mut stale) = active.take() {
+            stale.shutdown();
+        }
     }
     *active = Some(Session::start(serial, quality)?);
     Ok(())
@@ -301,10 +312,7 @@ pub fn request_stop() -> Result<(), String> {
 
 /// Current session status (or the idle default when nothing ever ran).
 pub fn poll_status() -> MirrorStatus {
-    active()
-        .as_ref()
-        .map(Session::snapshot)
-        .unwrap_or_default()
+    active().as_ref().map(Session::snapshot).unwrap_or_default()
 }
 
 /// Resolve the shipped scrcpy server jar: installed layout (bundled

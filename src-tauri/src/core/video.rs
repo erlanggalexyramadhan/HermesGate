@@ -98,14 +98,14 @@ mod native {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use windows::core::{
-        w, implement, BOOL, Error, IUnknown, Ref, Result as WinResult, HSTRING, PCWSTR,
+        implement, w, Error, IUnknown, Ref, Result as WinResult, BOOL, HSTRING, PCWSTR,
     };
     use windows::Win32::Foundation::{
         E_FAIL, E_INVALIDARG, E_NOTIMPL, FALSE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
     };
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, EndPaint, HBRUSH, HDC,
-        InvalidateRect, PAINTSTRUCT, SRCCOPY, StretchDIBits,
+        BeginPaint, EndPaint, InvalidateRect, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+        DIB_RGB_COLORS, HBRUSH, HDC, PAINTSTRUCT, SRCCOPY,
     };
     use windows::Win32::Media::MediaFoundation::*;
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
@@ -131,9 +131,9 @@ mod native {
         position: AtomicU64,
     }
 
-    impl IMFByteStream_Impl for SocketStream {
+    impl IMFByteStream_Impl for SocketStream_Impl {
         fn GetCapabilities(&self) -> WinResult<u32> {
-            // Readable and progressive — never seekable.
+            // Readable and progressive: never seekable.
             Ok(MFBYTESTREAM_IS_READABLE)
         }
 
@@ -158,40 +158,43 @@ mod native {
         }
 
         fn Read(&self, buffer: *mut u8, count: u32, read: *mut u32) -> WinResult<()> {
-                    let bytes = unsafe { std::slice::from_raw_parts_mut(buffer, count as usize) };
-                    let mut total = 0usize;
-                    while total == 0 {
-                        if self.control.stop_requested() {
-                            break;
-                        }
-                        match (*self.stream).read(&mut bytes[total..]) {
-                            Ok(0) => break,
-                            Ok(got) => total += got,
-                            Err(error)
-                                if matches!(
-                                    error.kind(),
-                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                                )
-                            {
-                                // Read tick: loop back and re-check the control flags.
-                            }
-                            Err(_) => break, // socket lost: Media Foundation sees EOS
-                        }
-                    }
-                    unsafe {
-                        *read = total as u32;
-                    }
-                    if total > 0 {
-                        self.position.fetch_add(total as u64, Ordering::SeqCst);
-                    }
-                    Ok(())
+            let bytes = unsafe { std::slice::from_raw_parts_mut(buffer, count as usize) };
+            let mut total = 0usize;
+            while total == 0 {
+                if self.control.stop_requested() {
+                    break;
                 }
+                match (&*self.stream).read(&mut bytes[total..]) {
+                    Ok(0) => break,
+                    Ok(got) => total += got,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => break, // socket lost: Media Foundation sees EOS
+                }
+            }
+            unsafe {
+                *read = total as u32;
+            }
+            if total > 0 {
+                self.position.fetch_add(total as u64, Ordering::SeqCst);
+            }
+            Ok(())
+        }
 
-        fn BeginRead(&self, _count: u32) -> WinResult<()> {
+        fn BeginRead(
+            &self,
+            _buffer: *mut u8,
+            _count: u32,
+            _callback: Ref<'_, IMFAsyncCallback>,
+            _state: Ref<'_, IUnknown>,
+        ) -> WinResult<()> {
             Err(E_NOTIMPL.into())
         }
 
-        fn EndRead(&self, _cookie: u64) -> WinResult<u32> {
+        fn EndRead(&self, _result: Ref<'_, IMFAsyncResult>) -> WinResult<u32> {
             Err(E_NOTIMPL.into())
         }
 
@@ -199,20 +202,26 @@ mod native {
             Err(E_NOTIMPL.into())
         }
 
-        fn BeginWrite(&self, _count: u32) -> WinResult<()> {
+        fn BeginWrite(
+            &self,
+            _data: *const u8,
+            _count: u32,
+            _callback: Ref<'_, IMFAsyncCallback>,
+            _state: Ref<'_, IUnknown>,
+        ) -> WinResult<()> {
             Err(E_NOTIMPL.into())
         }
 
-        fn EndWrite(&self, _cookie: u64) -> WinResult<u32> {
+        fn EndWrite(&self, _result: Ref<'_, IMFAsyncResult>) -> WinResult<u32> {
             Err(E_NOTIMPL.into())
         }
 
         fn Seek(
             &self,
             _origin: MFBYTESTREAM_SEEK_ORIGIN,
-            _flags: MFBYTESTREAM_SEEK_FLAG,
-            _position: *mut i64,
-        ) -> WinResult<()> {
+            _offset: i64,
+            _flags: u32,
+        ) -> WinResult<u64> {
             Err(E_NOTIMPL.into())
         }
 
@@ -310,7 +319,7 @@ mod native {
             let mut data = std::ptr::null_mut();
             let mut max_length = 0u32;
             let mut current_length = 0u32;
-            buffer.Lock(&mut data, &mut max_length, &mut current_length)?;
+            buffer.Lock(&mut data, Some(&mut max_length), Some(&mut current_length))?;
             let frame = normalize(data, current_length, width, height, stride);
             buffer.Unlock()?;
             frame
@@ -351,7 +360,11 @@ mod native {
         for y in 0..height as usize {
             // Negative stride = bottom-up: the locked buffer starts at the
             // last display row.
-            let row = if stride >= 0 { y } else { height as usize - 1 - y };
+            let row = if stride >= 0 {
+                y
+            } else {
+                height as usize - 1 - y
+            };
             let offset = row * abs_stride;
             if offset + row_bytes > source.len() {
                 break; // defensive: never read past the locked buffer
@@ -423,6 +436,7 @@ mod native {
                 return;
             }
         };
+        let hinstance: HINSTANCE = hinstance.into();
         register_class(hinstance);
         let hwnd = match create_window(hinstance, title, initial_size) {
             Some(hwnd) => hwnd,
@@ -447,7 +461,7 @@ mod native {
             if control.stop.load(Ordering::SeqCst) {
                 let _ = unsafe { DestroyWindow(hwnd) };
             }
-            if !unsafe { IsWindow(hwnd) }.as_bool() {
+            if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
                 break;
             }
             let fresh = slot.lock().map(|mut frame| frame.take()).unwrap_or(None);
@@ -461,7 +475,7 @@ mod native {
                         window.latest = Some(frame);
                     }
                 });
-                let _ = unsafe { InvalidateRect(hwnd, None, false) };
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             } else {
                 std::thread::sleep(Duration::from_millis(6));
             }
@@ -485,7 +499,7 @@ mod native {
                 hbrBackground: HBRUSH(std::ptr::null_mut()),
                 lpszMenuName: windows::core::PCWSTR(std::ptr::null()),
                 lpszClassName: CLASS_NAME,
-                hIconSm: HICON(std::ptr::null()),
+                hIconSm: HICON(std::ptr::null_mut()),
             };
             unsafe {
                 RegisterClassExW(&class);
@@ -509,8 +523,8 @@ mod native {
                 CLASS_NAME,
                 &HSTRING::from(title),
                 WS_OVERLAPPEDWINDOW,
-                CW_USEDEFAULT as i32,
-                CW_USEDEFAULT as i32,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
                 rect.right - rect.left,
                 rect.bottom - rect.top,
                 None,
@@ -560,8 +574,7 @@ mod native {
             WM_CLOSE => {
                 // User-initiated close: classify the session end as clean.
                 STATE.with(|state| {
-                    if let Some(window) = state.borrow().as_ref().and_then(|w| w.control.as_ref())
-                    {
+                    if let Some(window) = state.borrow().as_ref().and_then(|w| w.control.as_ref()) {
                         window.user_closed.store(true, Ordering::SeqCst);
                     }
                 });
@@ -570,8 +583,7 @@ mod native {
             }
             WM_DESTROY => {
                 STATE.with(|state| {
-                    if let Some(window) = state.borrow().as_ref().and_then(|w| w.control.as_ref())
-                    {
+                    if let Some(window) = state.borrow().as_ref().and_then(|w| w.control.as_ref()) {
                         window.window_dead.store(true, Ordering::SeqCst);
                     }
                 });
@@ -604,19 +616,21 @@ mod native {
         if dest_w <= 0 || dest_h <= 0 {
             return;
         }
-        let mut info = BITMAPINFO::default();
-        info.bmiHeader = BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: frame.width as i32,
-            biHeight: -(frame.height as i32), // negative = top-down
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            biSizeImage: 0,
-            biXPelsPerMeter: 0,
-            biYPelsPerMeter: 0,
-            biClrUsed: 0,
-            biClrImportant: 0,
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: frame.width as i32,
+                biHeight: -(frame.height as i32), // negative = top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            ..Default::default()
         };
         let _ = unsafe {
             StretchDIBits(
@@ -681,7 +695,7 @@ mod native {
         let slot: Arc<Mutex<Option<Frame>>> = Arc::new(Mutex::new(None));
         let mut presenter: Option<Presenter> = None;
         let mut size: Option<(u32, u32)> = None;
-        let mut end = StreamEnd::Disconnected;
+        let end;
         loop {
             if control.stop_requested() {
                 end = control_end(&control);
