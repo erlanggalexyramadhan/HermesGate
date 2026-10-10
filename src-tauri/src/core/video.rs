@@ -632,32 +632,23 @@ mod native {
 
     fn create_window(hinstance: HINSTANCE, title: &str, size: (u32, u32)) -> Option<HWND> {
         let size = fit_to_screen(size);
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: size.0 as i32,
-            bottom: size.1 as i32,
-        };
-        let _ = unsafe {
-            AdjustWindowRectEx(&mut rect, WS_OVERLAPPEDWINDOW, false, WINDOW_EX_STYLE(0))
-        };
-        let window_w = rect.right - rect.left;
-        let window_h = rect.bottom - rect.top;
-        // Centre it: a default position can put a tall window's lower half
-        // off the bottom of the desktop.
-        let (screen_w, screen_h) = screen();
-        let x = ((screen_w - window_w) / 2).max(0);
-        let y = ((screen_h - window_h) / 2).max(0);
+        // Borderless popup window: suitable for OBS window capture without
+        // title bars or frame interfering with the mirrored content.
+        let (window_w, window_h) = size;
+        // Position: upper-left corner (0,0) so OBS can capture the full area.
+        // The presenter/render loop will clip to the client area as needed.
+        let x = 0i32;
+        let y = 0i32;
         let created = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 CLASS_NAME,
                 &HSTRING::from(title),
-                WS_OVERLAPPEDWINDOW,
+                WS_POPUP, // popup without title border; suitable for OBS capture
                 x,
                 y,
-                window_w,
-                window_h,
+                window_w as i32,
+                window_h as i32,
                 None,
                 None,
                 Some(hinstance),
