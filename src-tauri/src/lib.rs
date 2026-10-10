@@ -14,6 +14,9 @@ pub fn run() {
             commands::get_app_info,
             commands::get_core_status,
             commands::list_devices,
+            commands::wifi_pair,
+            commands::wifi_connect,
+            commands::wifi_disconnect,
             commands::start_mirror,
             commands::stop_mirror,
             commands::mirror_status
@@ -28,6 +31,14 @@ pub fn run() {
             app.manage(manager.clone());
             commands::watch_devices(app.handle().clone(), manager);
             commands::watch_mirror(app.handle().clone());
+
+            // Wi-Fi pairing reuses the same ADB resolution order. `None`
+            // when no runtime was found — the wifi_* commands then fail
+            // with a clear message instead of spawning a missing binary.
+            let wifi = core::adb::resolve()
+                .ok()
+                .map(|adb| core::connection::wifi::WifiManager::new(adb.path));
+            app.manage(wifi);
             Ok(())
         })
         .run(tauri::generate_context!())

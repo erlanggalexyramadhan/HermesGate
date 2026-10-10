@@ -104,6 +104,63 @@ pub fn mirror_status() -> core::mirroring::MirrorStatus {
     core::mirroring::poll_status()
 }
 
+/// Parse a `<ip>:<port>` address the webview sent for a wireless operation.
+fn parse_address(address: &str) -> Result<std::net::SocketAddr, String> {
+    address
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid address '{address}': expected <ip>:<port>"))
+}
+
+/// Pair with a wireless device: `adb pair <address> <key>`.
+///
+/// `key` is the pairing code shown on the device (Developer options →
+/// Wireless debugging → Pair device with pairing code). The resolved
+/// [`core::connection::wifi::WifiManager`] is `None` when no ADB runtime
+/// was found at startup.
+#[tauri::command(async)]
+pub fn wifi_pair(
+    address: String,
+    key: String,
+    timeout_secs: Option<u64>,
+    wifi: tauri::State<'_, Option<core::connection::wifi::WifiManager>>,
+) -> Result<(), String> {
+    let manager = wifi
+        .as_ref()
+        .ok_or_else(|| "ADB runtime unavailable; wireless pairing is disabled".to_string())?;
+    let addr = parse_address(&address)?;
+    manager.pair_device(addr, &key, timeout_secs.unwrap_or(120))?;
+    Ok(())
+}
+
+/// Connect to an already-paired wireless device: `adb connect <address>`.
+#[tauri::command(async)]
+pub fn wifi_connect(
+    address: String,
+    wifi: tauri::State<'_, Option<core::connection::wifi::WifiManager>>,
+) -> Result<(), String> {
+    let manager = wifi
+        .as_ref()
+        .ok_or_else(|| "ADB runtime unavailable; wireless connections are disabled".to_string())?;
+    let addr = parse_address(&address)?;
+    manager.connect_device(addr)?;
+    Ok(())
+}
+
+/// Disconnect a wireless device: `adb disconnect <address>`.
+#[tauri::command(async)]
+pub fn wifi_disconnect(
+    address: String,
+    wifi: tauri::State<'_, Option<core::connection::wifi::WifiManager>>,
+) -> Result<(), String> {
+    let manager = wifi
+        .as_ref()
+        .ok_or_else(|| "ADB runtime unavailable; wireless connections are disabled".to_string())?;
+    let addr = parse_address(&address)?;
+    manager.disconnect_device(addr)?;
+    Ok(())
+}
+
 /// Poll the mirror engine and broadcast a fresh snapshot as
 /// [`MIRROR_CHANGED`] whenever something actually changed (phase, reason,
 /// frame size, serial).

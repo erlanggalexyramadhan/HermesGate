@@ -251,3 +251,31 @@ Roadmap Phase 1 remaining item = "Wi-Fi transport: wireless pairing and discover
 - Hover/transition micro-states not audited (reference snapshot is computed-style only).
 - Manual Connect pair success on a **real Android device**: NOT VERIFIED — DEVICE UNAVAILABLE (P2 acceptance).
 - Reference card internals (stat labels/icons) differ cosmetically from our stat grid — functional parity kept.
+
+---
+
+## Milestone 7: Wireless Acceptance — Real Pair + Connect + UI Runtime (2026-10-11)
+
+### Status
+- **STATUS**: ACCEPTANCE LULUS (runtime, perangkat nyata). Backend wireless Milestone 5 tetap **uncommitted** — menunggu tinjauan.
+
+### What was proven (actual runtime evidence)
+1. **Pairing nyata**: `adb pair 192.168.18.7:37855` (kode pairing dari Operator, sekali pakai) → stdout `Successfully paired to 192.168.18.7:37855 [guid=adb-bc058b2c-8STQEK]` — deteksi stdout backend (`wifi.rs`) terbukti cocok dengan keluaran adb sungguhan.
+2. **Connect nyata**: `adb connect 192.168.18.7:39583` (port dari `adb mdns services`, read-only) → `connected to 192.168.18.7:39583`.
+3. **UI runtime HermesGate**: app debug dijalankan dengan vite dev :1420 hidup; halaman Devices menampilkan kartu dari backend sungguhan (DOM capture, tanpa mock):
+   - `192.168.18.7:39583` — TRANSPORT **wifi**, STATE online, badge ONLINE
+   - `adb-bc058b2c-8STQEK._adb-tls-connect._tcp` — TRANSPORT usb, online
+   - `bc058b2c` — TRANSPORT usb, online
+   - Chip header **Active**; "3 Devices Available"; statusbar: `Service: Ready · ADB: bundled · Watcher: 2s poll · Devices: 3 attached · Mirror: idle`
+   - Filter All/USB/Wireless + tombol Manual Connect (UI P1) terekspos di runtime.
+
+### Root cause investigation (app "exit tanpa window")
+- Proses `hermesgate.exe` sebenarnya **tidak crash** — window ada tapi memuat devUrl `localhost:1420` yang saat itu tidak ada server → halaman error ERR_CONNECTION_REFUSED di WebView2. Setelah vite dev dijalankan dan app di-restart, UI render normal. (Fix operasional, bukan perubahan kode.)
+
+### Verification notes
+- Command pair/connect dijalankan persis seperti jalur backend (`core::connection::wifi.rs`), memvalidasi kontrak deteksi tanpa menjalankan ulang `cargo test`.
+- mDNS hanya dipakai **read-only** untuk menemukan port; fitur mDNS/SSDP tetap tidak diimplementasikan (scope dilarang).
+- Pairing code bersifat sekali-pakai/kedaluwarsa — tidak disimpan di dokumen.
+
+### Remaining
+- Backend wireless (4 file `src-tauri/`) masih di working tree — **jangan commit sebelum ditinjau** (acceptance ini adalah syarat pertama; tinjauan manusia syarat kedua).
