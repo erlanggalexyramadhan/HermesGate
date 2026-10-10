@@ -3,6 +3,7 @@ import {
   core,
   devices,
   mirror,
+  wireless,
   type AppInfo,
   type ModuleInfo,
   type DeviceSnapshot,
@@ -163,14 +164,27 @@ function App() {
 }
 
 /**
- * Devices view. Discovery itself is native: the Rust core polls `adb`,
- * keeps device state, and pushes a `devices-changed` event whenever the
- * picture changes. This component only fetches the first snapshot, listens,
- * and renders it.
+ * Devices view. Discovery itself is native: the Rust core polls `adb` every
+ * 2 s (watch_devices in commands.rs), keeps device state, and pushes a
+ * `devices-changed` event whenever the picture changes. This component only
+ * fetches the first snapshot, listens, and renders it in the reference
+ * layout: Established Connections (cards), Active Discovery (watcher
+ * status), Awaiting Authorization (unauthorized devices) and a service
+ * status bar. Only fields the backend actually reports are shown — no IP,
+ * battery, uptime, encoder, latency or FPS.
  */
 function DevicesPanel() {
   const [snapshot, setSnapshot] = useState<DeviceSnapshot | null>(null);
+  const [mirrorStatus, setMirrorStatus] = useState<MirrorStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [filter, setFilter] = useState<"all" | "usb" | "wifi">("all");
+  const [pairOpen, setPairOpen] = useState(false);
+  const [pairAddress, setPairAddress] = useState("");
+  const [pairKey, setPairKey] = useState("");
+  const [pairResult, setPairResult] = useState<
+    { ok: boolean; text: string } | null
+  >(null);
+  const [pairBusy, setPairBusy] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -182,12 +196,24 @@ function DevicesPanel() {
       .catch((err) => {
         if (alive) setError(String(err));
       });
-    const unlisten = devices.onChanged((next) => {
+    mirror
+      .status()
+      .then((next) => {
+        if (alive) setMirrorStatus(next);
+      })
+      .catch(() => {
+        // Mirror status is decorative here; the mirroring view reports it.
+      });
+    const unlistenDevices = devices.onChanged((next) => {
       if (alive) setSnapshot(next);
+    });
+    const unlistenMirror = mirror.onChanged((next) => {
+      if (alive) setMirrorStatus(next);
     });
     return () => {
       alive = false;
-      unlisten.then((off) => off());
+      unlistenDevices.then((off) => off());
+      unlistenMirror.then((off) => off());
     };
   }, []);
 
@@ -205,8 +231,128 @@ function DevicesPanel() {
   }
 
   const { adb, devices: list } = snapshot;
+  const visible = list.filter(
+    (device) => filter === "all" || device.transport === filter,
+  );
+  const established = visible.filter((device) => device.state === "online");
+  const awaiting = visible.filter((device) => device.state === "unauthorized");
+  const notAttached = visible.length - established.length - awaiting.length;
+
   return (
     <>
+      <header className="disc-header">
+        <div className="disc-title-row">
+          <h1 className="disc-title">Discovery</h1>
+          <span className={adb.available && !adb.error ? "chip chip-active" : "chip"}>
+            {adb.available && !adb.error ? "Active" : "Idle"}
+          </span>
+        </div>
+        <div className="disc-controls">
+          <div className="disc-filters" role="group" aria-label="Transport filter">
+            {(
+              [
+                ["all", "All Devices"],
+                ["usb", "USB Only"],
+                ["wifi", "Wireless"],
+              ] as const
+            ).map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                className={
+                  filter === value ? "disc-filter is-active" : "disc-filter"
+                }
+                onClick={() => setFilter(value)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => {
+              setPairOpen((open) => !open);
+              setPairResult(null);
+            }}
+          >
+            Manual Connect
+          </button>
+        </div>
+      </header>
+
+      {pairOpen && (
+        <section className="panel">
+          <div className="panel-head">
+            <h2>Manual Connect</h2>
+            <span className="chip">adb pair</span>
+          </div>
+          <form
+            className="pair-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const address = pairAddress.trim();
+              const key = pairKey.trim();
+              if (!/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(address)) {
+                setPairResult({
+                  ok: false,
+                  text: "Address must look like 192.168.1.42:37000.",
+                });
+                return;
+              }
+              if (!/^\d{4,8}$/.test(key)) {
+                setPairResult({
+                  ok: false,
+                  text: "Pairing key is the 4–8 digit code shown on the device.",
+                });
+                return;
+              }
+              setPairBusy(true);
+              setPairResult(null);
+              wireless
+                .pair(address, key)
+                .then(() => {
+                  setPairResult({
+                    ok: true,
+                    text: `Paired to ${address} — the device should appear above once authorized.`,
+                  });
+                })
+                .catch((err) => {
+                  setPairResult({ ok: false, text: String(err) });
+                })
+                .finally(() => setPairBusy(false));
+            }}
+          >
+            <input
+              type="text"
+              placeholder="192.168.1.42:37000"
+              value={pairAddress}
+              onChange={(event) => setPairAddress(event.target.value)}
+              aria-label="Device address"
+            />
+            <input
+              type="text"
+              placeholder="Pairing key"
+              value={pairKey}
+              onChange={(event) => setPairKey(event.target.value)}
+              aria-label="Pairing key"
+            />
+            <button type="submit" className="btn btn-primary" disabled={pairBusy}>
+              {pairBusy ? "Pairing…" : "Pair"}
+            </button>
+          </form>
+          {pairResult && (
+            <p
+              className={
+                pairResult.ok ? "pair-result is-ok" : "pair-result is-error"
+              }
+            >
+              {pairResult.text}
+            </p>
+          )}
+        </section>
+      )}
+
       {adb.error && (
         <div className="banner">
           ADB problem — device detection is degraded.
@@ -216,54 +362,138 @@ function DevicesPanel() {
 
       <section className="panel">
         <div className="panel-head">
-          <h2>Android devices</h2>
+          <h2>Established Connections</h2>
           <span className="chip">
-            {adb.error
-              ? "adb error"
-              : adb.available
-                ? `adb · ${adb.source ?? "ready"}`
-                : "adb unavailable"}{" "}
-            · {list.length} attached
+            {established.length} Device{established.length === 1 ? "" : "s"}{" "}
+            Available
           </span>
         </div>
-        <table className="table">
-          <thead>
-            <tr>
-              <th>Device</th>
-              <th>Model</th>
-              <th>Android</th>
-              <th>Transport</th>
-              <th className="col-state">State</th>
-            </tr>
-          </thead>
-          <tbody>
-            {list.length === 0 ? (
-              <tr>
-                <td className="muted" colSpan={5}>
-                  {adb.error
-                    ? "No devices: the ADB call failed (see the banner above)."
-                    : "No Android devices attached — connect one over USB and allow USB debugging."}
-                </td>
-              </tr>
-            ) : (
-              list.map((device) => (
-                <tr key={device.serial}>
-                  <td>
-                    {device.serial}
-                    {device.manufacturer && <p className="muted">{device.manufacturer}</p>}
-                  </td>
-                  <td className="muted">{device.model ?? "—"}</td>
-                  <td className="muted">{device.androidVersion ?? "—"}</td>
-                  <td className="muted">{device.transport}</td>
-                  <td className="col-state">
+        {established.length === 0 ? (
+          <div className="disc-body">
+            <p className="muted">
+              No Android devices attached — connect one over USB and allow
+              USB debugging.
+            </p>
+          </div>
+        ) : (
+          <div className="disc-grid">
+            {established.map((device) => {
+              const resolution =
+                mirrorStatus?.running === true &&
+                mirrorStatus.serial === device.serial &&
+                mirrorStatus.width > 0 &&
+                mirrorStatus.height > 0
+                  ? `${mirrorStatus.width} × ${mirrorStatus.height} px`
+                  : "not mirroring";
+              return (
+                <article className="device-card" key={device.serial}>
+                  <div className="device-card-head">
+                    <h3>{device.model ?? device.serial}</h3>
                     <span className="state">{device.state}</span>
-                  </td>
-                </tr>
-              ))
-            )}
-          </tbody>
-        </table>
+                  </div>
+                  <p className="device-id">{device.serial}</p>
+                  <div className="stats">
+                    <div className="stat">
+                      <span className="stat-label">Manufacturer</span>
+                      <span className="stat-value">
+                        {device.manufacturer ?? "—"}
+                      </span>
+                    </div>
+                    <div className="stat">
+                      <span className="stat-label">Transport</span>
+                      <span className="stat-value">{device.transport}</span>
+                    </div>
+                    <div className="stat">
+                      <span className="stat-label">State</span>
+                      <span className="stat-value">{device.state}</span>
+                    </div>
+                    <div className="stat">
+                      <span className="stat-label">Mirror resolution</span>
+                      <span className="stat-value">{resolution}</span>
+                    </div>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
       </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Active Discovery</h2>
+          <span className="chip">
+            {adb.error
+              ? "degraded"
+              : adb.available
+                ? `adb · ${adb.source ?? "ready"}`
+                : "adb unavailable"}
+          </span>
+        </div>
+        <div className="disc-body">
+          <p>
+            {adb.available && !adb.error
+              ? "Scanning for device changes…"
+              : "Discovery is not running."}
+          </p>
+          <p className="muted">
+            Native watcher polls <code>adb devices</code> every 2 seconds and
+            broadcasts a fresh snapshot whenever something changes.
+          </p>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Awaiting Authorization</h2>
+          <span className="chip">{awaiting.length} pending</span>
+        </div>
+        {awaiting.length === 0 ? (
+          <div className="disc-body">
+            <p className="muted">
+              No devices waiting — every attached device is authorized.
+            </p>
+          </div>
+        ) : (
+          awaiting.map((device) => (
+            <div className="auth-item" key={device.serial}>
+              <div>
+                <h4>{device.model ?? device.serial}</h4>
+                <p className="muted">
+                  {device.serial} · confirm USB debugging on the device
+                  screen.
+                </p>
+              </div>
+              <span className="state">{device.state}</span>
+            </div>
+          ))
+        )}
+      </section>
+
+      <footer className="statusbar">
+        <span>
+          Service: <strong>{adb.error ? "degraded" : "Ready"}</strong>
+        </span>
+        <span>
+          ADB:{" "}
+          <strong>
+            {adb.available ? (adb.source ?? "ready") : "unavailable"}
+          </strong>
+        </span>
+        <span>
+          Watcher: <strong>2s poll</strong>
+        </span>
+        <span>
+          Devices: <strong>{list.length} attached</strong>
+          {notAttached > 0 && ` (${notAttached} offline/disconnected)`}
+        </span>
+        <span>
+          Mirror:{" "}
+          <strong>
+            {mirrorStatus?.running === true ? mirrorStatus.phase : "idle"}
+          </strong>
+        </span>
+      </footer>
     </>
   );
 }

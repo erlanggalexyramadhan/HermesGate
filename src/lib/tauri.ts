@@ -94,3 +94,17 @@ export const mirror = {
   onChanged: (handler: (status: MirrorStatus) => void) =>
     listen<MirrorStatus>("mirror-changed", (event) => handler(event.payload)),
 };
+
+/**
+ * Wireless ADB pairing and connections. `pair` takes the `ip:port` shown on
+ * the device's wireless-debugging screen plus the six-digit pairing key;
+ * `connect`/`disconnect` drive endpoints that are already paired. Every call
+ * rejects with a plain message (for example when no ADB runtime exists).
+ */
+export const wireless = {
+  pair: (address: string, key: string) =>
+    invoke<void>("wifi_pair", { address, key }),
+  connect: (address: string) => invoke<void>("wifi_connect", { address }),
+  disconnect: (address: string) =>
+    invoke<void>("wifi_disconnect", { address }),
+};
