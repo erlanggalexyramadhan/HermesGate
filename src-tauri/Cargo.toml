@@ -1,6 +1,6 @@
 [package]
 name = "hermesgate"
-version = "0.1.0"
+version = "0.1.1"
 description = "HermesGate — Android mirroring and control for the desktop, by Lex"
 authors = ["Erlangga Lexy Ramadhan"]
 edition = "2021"

@@ -133,9 +133,30 @@ pub fn resolve() -> Result<Adb, String> {
     Err("adb not found: install Android platform-tools or set HERMESGATE_ADB".to_string())
 }
 
+/// Begin an `adb` invocation that cannot open a console window.
+///
+/// The release app is a GUI-subsystem binary (`windows_subsystem = "windows"`),
+/// so it has no console to lend a child. A console-subsystem child spawned with
+/// default flags therefore gets a brand-new console allocated by Windows: one
+/// console window (plus its `conhost`/`OpenConsole` host) per call — and the
+/// device watcher calls `adb` every two seconds, so the desktop flashed a
+/// terminal continuously. `CREATE_NO_WINDOW` gives the child no console at all,
+/// which is all it needs: nothing here reads its console.
+pub fn command(adb: &Path) -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new(adb);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// Run one `adb` command and return its standard output.
 pub fn run(adb: &Path, args: &[&str]) -> Result<String, String> {
-    let mut child = Command::new(adb)
+    let mut child = command(adb)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -186,7 +207,7 @@ pub fn run(adb: &Path, args: &[&str]) -> Result<String, String> {
 /// Used by the mirroring session for the scrcpy server shell command, which
 /// lives as long as the session. The caller owns the child and must reap it.
 pub fn spawn(adb: &Path, args: &[&str]) -> Result<std::process::Child, String> {
-    Command::new(adb)
+    command(adb)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

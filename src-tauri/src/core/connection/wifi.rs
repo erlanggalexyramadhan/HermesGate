@@ -13,7 +13,7 @@
 
 use serde::Serialize;
 use std::net::SocketAddr;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 // Transport used to reach a device.
@@ -113,7 +113,7 @@ impl WifiManager {
     /// an async runtime — pairing is a rare, user-initiated action, so a
     /// 200 ms poll costs nothing and keeps the command layer synchronous.
     fn run_adb(&self, args: &[&str], timeout_secs: u64) -> Result<(String, String), String> {
-        let mut child = Command::new(&self.adb_path)
+        let mut child = crate::core::adb::command(&self.adb_path)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
