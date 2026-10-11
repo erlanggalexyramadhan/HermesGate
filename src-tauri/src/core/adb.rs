@@ -64,6 +64,11 @@ pub struct DeviceProps {
     pub manufacturer: Option<String>,
     pub model: Option<String>,
     pub android_version: Option<String>,
+    /// `ro.serialno`: the hardware serial. The same phone answers to several
+    /// ADB serials at once (hardware serial, mDNS alias, `ip:port`) and this is
+    /// the only field that is identical across all of them, so it is what
+    /// [`super::device`] groups by.
+    pub serialno: Option<String>,
 }
 
 /// Locate `adb`.
@@ -196,6 +201,8 @@ pub fn list_devices(adb: &Path) -> Result<Vec<RawDevice>, String> {
 }
 
 /// Read manufacturer, model and Android version from an attached device.
+///
+/// Works over any transport: `ip:port` serials answer exactly like USB ones.
 pub fn device_props(adb: &Path, serial: &str) -> Result<DeviceProps, String> {
     Ok(parse_props(&run(adb, &["-s", serial, "shell", "getprop"])?))
 }
@@ -229,16 +236,20 @@ fn parse_props(output: &str) -> DeviceProps {
         let Some(rest) = line.trim().strip_prefix('[') else {
             continue;
         };
-        let Some((key, value)) = rest.split_once("]:[") else {
+        // `getprop` prints `[key]: [value]` — a space after the colon, and on
+        // Windows a CRLF tail. The trimmed value is therefore bracketed again
+        // before the brackets come off.
+        let Some((key, value)) = rest.split_once("]:") else {
             continue;
         };
-        let value = value.trim_end_matches(']');
+        let value = value.trim().trim_matches(['[', ']', '\r', ' ']);
         if value.is_empty() {
             continue;
         }
         match key {
             "ro.product.manufacturer" => props.manufacturer = Some(value.to_string()),
             "ro.product.model" => props.model = Some(value.to_string()),
+            "ro.serialno" => props.serialno = Some(value.to_string()),
             "ro.build.version.release" => props.android_version = Some(value.to_string()),
             _ => {}
         }
@@ -297,10 +308,20 @@ mod tests {
         0123456789ABCDEF          offline\n\
         * daemon started successfully\n";
 
+    /// Old no-space fixture, kept: both shapes have to parse.
     const GETPROP_OUT: &str = "[ro.product.manufacturer]:[samsung]\n\
         [ro.product.model]:[SM-G973F]\n\
         [ro.build.version.release]:[14]\n\
         [ro.product.name]:[beyond1]\n";
+
+    /// Verbatim from the bench device (`adb -s <serial> shell getprop`): a space
+    /// after the colon and a CRLF tail. The parser used to require `]:[`, which
+    /// matched this on paper and nothing in reality — every property came back
+    /// empty, so one phone showed up as several devices.
+    const GETPROP_REAL_OUT: &str = "[ro.product.manufacturer]: [OPPO]\r\n\
+        [ro.product.model]: [CPH2773]\r\n\
+        [ro.serialno]: [bc058b2c]\r\n\
+        [ro.build.version.release]: [13]\r\n";
 
     #[test]
     fn parses_device_states_and_models() {
@@ -312,6 +333,21 @@ mod tests {
         assert_eq!(devices[1].state, "unauthorized");
         assert_eq!(devices[1].model, None);
         assert_eq!(devices[2].state, "offline");
+    }
+
+    #[test]
+    fn parses_the_hardware_serial() {
+        let props = parse_props("[ro.serialno]:[R5CT30ABCXY]\n");
+        assert_eq!(props.serialno.as_deref(), Some("R5CT30ABCXY"));
+    }
+
+    #[test]
+    fn parses_the_format_the_device_actually_prints() {
+        let props = parse_props(GETPROP_REAL_OUT);
+        assert_eq!(props.manufacturer.as_deref(), Some("OPPO"));
+        assert_eq!(props.model.as_deref(), Some("CPH2773"));
+        assert_eq!(props.serialno.as_deref(), Some("bc058b2c"));
+        assert_eq!(props.android_version.as_deref(), Some("13"));
     }
 
     #[test]

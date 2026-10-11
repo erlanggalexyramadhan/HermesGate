@@ -84,11 +84,24 @@ pub fn watch_devices(
 /// [`core::mirroring::MirrorStatus`].
 pub const MIRROR_CHANGED: &str = "mirror-changed";
 
-/// Start mirroring `serial` with the default quality knobs (the engine's
-/// scrcpy defaults: native resolution, 8 Mbit/s, uncapped fps).
+/// Start mirroring `serial` with the mode the Device page selected
+/// (`sharp` | `balanced` | `smooth`); `None` keeps the engine's default knobs
+/// (native resolution, 8 Mbit/s, uncapped fps). An unknown mode is rejected
+/// instead of silently falling back, so the UI never claims a mode it did not
+/// get.
+///
+/// `serial` is the serial of the transport the user chose
+/// ([`core::device::DeviceEndpoint::serial`]): `bc058b2c` for USB,
+/// `192.168.1.42:37000` for Wi-Fi. `adb` routes every pipeline step through it,
+/// so the session runs over the selected transport rather than an arbitrary
+/// endpoint of the same phone.
 #[tauri::command]
-pub fn start_mirror(serial: String) -> Result<(), String> {
-    core::mirroring::request_start(&serial, core::mirroring::MirrorQuality::default())
+pub fn start_mirror(serial: String, mode: Option<String>) -> Result<(), String> {
+    let quality = match mode {
+        Some(name) => core::mirroring::MirrorQuality::preset(&name)?,
+        None => core::mirroring::MirrorQuality::default(),
+    };
+    core::mirroring::request_start(&serial, quality)
 }
 
 /// Stop the active mirror session. Idempotent: stopping while idle is a
@@ -163,7 +176,7 @@ pub fn wifi_disconnect(
 
 /// Poll the mirror engine and broadcast a fresh snapshot as
 /// [`MIRROR_CHANGED`] whenever something actually changed (phase, reason,
-/// frame size, serial).
+/// frame size, serial, or the 1 Hz pipeline counters the session publishes).
 ///
 /// ponytail: a 1 s poll instead of hooking every engine transition — the
 /// engine already keeps a plain `MirrorStatus`, and a UI that reacts within
@@ -183,4 +196,24 @@ pub fn watch_mirror(app: tauri::AppHandle) {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     });
+}
+
+/// Send one navigation key press to the device over the running session's
+/// control channel.
+///
+/// `key` is the name the session panel uses. Fails rather than silently doing
+/// nothing when no session is forwarding input.
+#[tauri::command]
+pub fn mirror_key(key: String) -> Result<(), String> {
+    let keycode = match key.as_str() {
+        "back" => core::input::KEYCODE_BACK,
+        "home" => core::input::KEYCODE_HOME,
+        "recents" => core::input::KEYCODE_APP_SWITCH,
+        other => return Err(format!("unknown navigation key '{other}'")),
+    };
+    let Some(controller) = core::input::active() else {
+        return Err("no mirror session is forwarding input".to_string());
+    };
+    controller.key(keycode);
+    Ok(())
 }

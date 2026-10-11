@@ -32,7 +32,7 @@ use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext,
     ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
-    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView, D3D11_BIND_FLAG,
+    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView, D3D11_BIND_FLAG, D3D11_BOX,
     D3D11_CPU_ACCESS_FLAG, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
     D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE, D3D11_USAGE_DEFAULT,
@@ -355,10 +355,25 @@ impl Copier {
     }
 
     /// Copy one decoded picture into the next ring surface.
+    ///
+    /// The decoder hands out surfaces of its own size; the copy is clamped to
+    /// the overlap with the ring surface, so a size the ring was not built for
+    /// can never read past the end of either surface.
     pub fn copy(&mut self, source: &ID3D11Texture2D, subresource: u32) -> Texture {
         let index = self.next;
         self.next = (self.next + 1) % self.surfaces.len();
         let texture = self.surfaces[index].clone();
+        let (width, height) = overlap(self.coded, surface_size(source));
+        // The source region is given explicitly: the whole picture would be the
+        // default, which does not fit a surface larger than the ring.
+        let region = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: width,
+            bottom: height,
+            back: 1,
+        };
         unsafe {
             self.device.context.CopySubresourceRegion(
                 &texture,
@@ -368,7 +383,7 @@ impl Copier {
                 0,
                 source,
                 subresource,
-                None,
+                Some(&region),
             )
         };
         Texture {
@@ -376,6 +391,16 @@ impl Copier {
             subresource: 0,
         }
     }
+}
+
+/// How much of two surfaces overlaps, in whole chroma pairs.
+///
+/// A copy or a source rectangle has to stay inside the surface it reads, and an
+/// NV12 allocation is addressed two rows and two columns at a time, so the
+/// smaller extent is rounded down to an even number.
+fn overlap(a: (u32, u32), b: (u32, u32)) -> (u32, u32) {
+    let even = |value: u32| (value - value % 2).max(1);
+    (even(a.0.min(b.0)), even(a.1.min(b.1)))
 }
 
 /// NV12 → RGB conversion for one picture geometry, on the GPU.
@@ -410,14 +435,15 @@ struct BgraPath {
 }
 
 impl Converter {
-    /// Build the converter for `geometry` (the visible picture) writing into
-    /// surfaces of `output` size.
+    /// Build the converter for a picture of `coded` extent — `geometry` is the
+    /// visible part of it — writing into surfaces of `output` size.
     pub fn new(
         device: Arc<Device>,
+        coded: (u32, u32),
         geometry: (u32, u32),
         output: (u32, u32),
     ) -> Result<Self, String> {
-        let (enumerator, processor) = video_processor(&device, geometry, output)?;
+        let (enumerator, processor) = video_processor(&device, coded, output)?;
         Ok(Self {
             device,
             enumerator,
@@ -445,7 +471,10 @@ impl Converter {
     ) -> Result<(), String> {
         let view = self.input_view(source, subresource)?;
         let output_view = self.output_view(output)?;
-        let source_rect = source_rect(self.geometry);
+        // The source rectangle is the visible part of the picture, clamped to
+        // the surface it is taken from: the decoder's surfaces do not have to
+        // be the size the converter was built for.
+        let source_rect = source_rect(overlap(self.geometry, surface_size(source)));
         unsafe {
             self.device
                 .video_context
@@ -656,6 +685,13 @@ fn video_processor(
     Ok((enumerator, processor))
 }
 
+/// The size of a texture's surface, in pixels.
+fn surface_size(texture: &ID3D11Texture2D) -> (u32, u32) {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { texture.GetDesc(&mut desc) };
+    (desc.Width, desc.Height)
+}
+
 /// One video processor operation: scale and convert the input onto `target`.
 fn blit(
     device: &Arc<Device>,
@@ -701,10 +737,11 @@ impl Presenter {
         device: Arc<Device>,
         hwnd: HWND,
         client: (u32, u32),
+        coded: (u32, u32),
         geometry: (u32, u32),
     ) -> Result<Self, String> {
         let swap_chain = create_swap_chain(&device, hwnd, client)?;
-        let converter = Converter::new(device, geometry, client)?;
+        let converter = Converter::new(device, coded, geometry, client)?;
         Ok(Self {
             converter,
             swap_chain,
@@ -877,13 +914,21 @@ fn yuv_color_space() -> D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
     }
 }
 
-/// The colour space of the BGRA the software decoder produces.
+/// The colour space of the BGRA the software decoder produces: display-referred
+/// full-range RGB, so both range fields must say 0-255.
+///
+/// `RGB_Range` is 0 for full range and 1 for limited range (d3d11.h, member
+/// table of D3D11_VIDEO_PROCESSOR_COLOR_SPACE), and `NOMINAL_RANGE_0_255` is 2
+/// -- 0 is `..._UNDEFINED` (D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE). Declaring 1/0
+/// told the processor that display-range pixels were studio-range 16-235, so it
+/// stretched every channel back to 0-255: measured as a gain of ~1.13 with a
+/// negative offset in the software-decode path (docs/WORKLOG.md).
 fn rgb_color_space() -> D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
     const USAGE_PLAYBACK: u32 = 0;
-    const RGB_FULL_RANGE: u32 = 1;
+    const RGB_FULL_RANGE: u32 = 0;
     const YCBCR_MATRIX_BT601: u32 = 0;
     const XVYCC_OFF: u32 = 0;
-    const NOMINAL_RANGE_0_255: u32 = 0;
+    const NOMINAL_RANGE_0_255: u32 = 2;
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
         _bitfield: USAGE_PLAYBACK
             | (RGB_FULL_RANGE << 1)

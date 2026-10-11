@@ -4,12 +4,11 @@
 Android device, built for low-latency use cases such as content creation and OBS
 workflows.
 
-> **Status: Phase 1 (device detection).** This repository ships the application
-> foundation — a Tauri 2 shell, a React + TypeScript UI, and a Rust native core —
-> plus **USB Android device detection**: HermesGate bundles its own ADB runtime,
-> enumerates attached devices with their state and basic metadata, and shows them
-> in the Devices view. Screen mirroring, input injection and wireless pairing are
-> **not implemented yet**; they are staged in the
+> **Status: v0.1.0 — mirroring works end to end (Windows).** The app connects to
+> an Android device over **USB or Wi-Fi**, mirrors its screen into a separate,
+> normal desktop window, plays its audio, and sends back / home / recents to the
+> device. Clipboard sync, persisted settings, full pointer and gesture input, and
+> platforms other than Windows are **not implemented yet**; they are staged in the
 > [roadmap](docs/roadmap.md).
 
 ## What exists today
@@ -17,15 +16,27 @@ workflows.
 - **Tauri 2 desktop shell** — main window, CSP, capability-scoped webview.
 - **React 19 + TypeScript frontend** — dashboard UI that talks to the native core
   through typed Tauri commands only.
-- **USB device detection** — the bundled `adb` runtime
+- **Device detection (USB + Wi-Fi)** — the bundled `adb` runtime
   (`src-tauri/binaries/`, official platform-tools) enumerates attached Android
   devices; states (online / unauthorized / offline / disconnected) and metadata
   (serial, manufacturer, model, Android version) are kept by the Rust core and
   pushed to the Devices view through a Tauri event. No Android SDK install is
   required.
+- **Mirroring** — the device screen is streamed with H.264 (a bundled `scrcpy`
+  server is pushed over ADB), decoded natively with Media Foundation — software by
+  default, opt-in hardware D3D11 decoding — and presented in a **separate mirror
+  window** that carries only the picture, for OBS window capture.
+- **Audio forwarding** — the device's audio stream is played on the desktop
+  output through WASAPI.
+- **Wi-Fi transport** — wireless debugging pairing and discovery (mDNS, `adb
+  pair`) alongside USB, with disconnect in the UI.
+- **Navigation keys** — back / home / recents are injected into the running
+  session's control channel.
+- **Live session telemetry** — decode FPS, received bandwidth, decode/present
+  timing, dropped frames and audio format are shown while a session runs.
 - **Rust native core** — module boundaries for Device Manager, Connection Manager
-  (USB/Wi-Fi), ADB, Mirroring, Input, Video/Rendering, Clipboard and Settings,
-  plus a module registry surfaced in the UI.
+  (USB/Wi-Fi), ADB, Mirroring, Input, Video/Rendering, Audio, Clipboard and
+  Settings, plus a module registry surfaced in the UI.
 - **CI** — frontend typecheck/build and Rust fmt/clippy/test on every push and PR.
 - **Documentation** — architecture, development setup, roadmap and ADRs.
 
@@ -42,10 +53,9 @@ workflows.
 └──────────────────────────┘
 ```
 
-Frame data and input events are planned to stay entirely on the native side;
-JavaScript is not part of the future video path. Details, including the shared
-pipeline and the clean mirror window design, are in
-[docs/architecture.md](docs/architecture.md).
+Decoded frames and input never cross the webview: the UI is told about *state*,
+never about pixels. Details, including the shared pipeline and the clean mirror
+window design, are in [docs/architecture.md](docs/architecture.md).
 
 ## Getting started
 
@@ -70,7 +80,9 @@ npm run tauri build # production bundle
 │       ├── lib.rs        # Tauri builder + command registration
 │       ├── commands.rs   # command layer (the only frontend surface)
 │       └── core/         # native core module boundaries
+├── src-tauri/binaries/   # bundled adb (platform-tools) and scrcpy server
 ├── docs/                 # architecture, development, roadmap, ADRs
+├── tools/bench/          # measurement scripts used during development
 └── .github/workflows/    # CI
 ```
 
@@ -80,7 +92,8 @@ npm run tauri build # production bundle
 |----------|----------|
 | [Architecture](docs/architecture.md) | Layering, module boundaries, transport-agnostic pipeline, mirror window design |
 | [Development](docs/development.md) | Prerequisites, setup, day-to-day commands |
-| [Roadmap](docs/roadmap.md) | Ordered phases from bootstrap to mirroring |
+| [Roadmap](docs/roadmap.md) | Ordered phases, with what is shipped marked |
+| [PRD](docs/PRD.md) | Product requirements and acceptance criteria for v1 |
 | [ADRs](docs/adr/) | Decisions that shape the foundation |
 
 ## License

@@ -10,6 +10,7 @@
 //! | Module          | Responsibility                                            |
 //! |-----------------|-----------------------------------------------------------|
 //! | [`device`]      | Device Manager: discovery, identity and state of devices  |
+//! | [`audio`]       | Audio engine: the device's playback, played on the desktop|
 //! | [`connection`]  | Connection Manager: USB / Wi-Fi transports, pairing        |
 //! | [`adb`]         | ADB integration: the single place that talks to `adb`      |
 //! | [`mirroring`]   | Mirroring engine: session lifecycle for screen streaming   |
@@ -18,11 +19,14 @@
 //! | [`clipboard`]   | Clipboard synchronisation between desktop and device       |
 //! | [`settings`]    | Persisted application settings                             |
 //!
-//! The registry reports each module's real state: `device` and `adb` are
-//! implemented for USB device detection, the rest are roadmap items
-//! (`docs/roadmap.md`).
+//! The registry reports each module's real state: `device`, `adb` and `audio`
+//! are complete for V1 (device detection, the single `adb` gateway, and playing
+//! the device's audio on the desktop), `connection`, `mirroring`, `input` and
+//! `video` are partial (verified live, with named gaps), and `clipboard` and
+//! `settings` are roadmap items (`docs/roadmap.md`).
 
 pub mod adb;
+pub mod audio;
 pub mod clipboard;
 pub mod connection;
 pub mod device;
@@ -82,20 +86,26 @@ pub const MODULES: &[ModuleInfo] = &[
     ModuleInfo {
         id: "mirroring",
         name: "Mirroring Engine",
-        state: "planned",
+        state: "partial",
         responsibility: "Session lifecycle for streaming a device screen.",
     },
     ModuleInfo {
         id: "input",
         name: "Input Engine",
-        state: "planned",
+        state: "partial",
         responsibility: "Inject touch, key and gesture events into the device.",
     },
     ModuleInfo {
         id: "video",
         name: "Video & Rendering",
-        state: "planned",
+        state: "partial",
         responsibility: "Native decode and GPU rendering of mirrored frames.",
+    },
+    ModuleInfo {
+        id: "audio",
+        name: "Audio Engine",
+        state: "ready",
+        responsibility: "Play the device's audio stream on the desktop output.",
     },
     ModuleInfo {
         id: "clipboard",

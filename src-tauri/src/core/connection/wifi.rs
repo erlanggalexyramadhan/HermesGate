@@ -128,16 +128,11 @@ impl WifiManager {
                     if Instant::now() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
-                        return Err(format!(
-                            "adb {} timed out after {}s",
-                            args[0], timeout_secs
-                        ));
+                        return Err(format!("adb {} timed out after {}s", args[0], timeout_secs));
                     }
                     std::thread::sleep(Duration::from_millis(200));
                 }
-                Err(e) => {
-                    return Err(format!("failed while waiting for adb {}: {}", args[0], e))
-                }
+                Err(e) => return Err(format!("failed while waiting for adb {}: {}", args[0], e)),
             }
         }
 
@@ -174,8 +169,7 @@ impl WifiManager {
             return Err("pairing key is empty".to_string());
         }
 
-        let (stdout, stderr) =
-            self.run_adb(&["pair", &address.to_string(), key], timeout_secs)?;
+        let (stdout, stderr) = self.run_adb(&["pair", &address.to_string(), key], timeout_secs)?;
 
         // adb prints "Successfully paired to 192.168.x.x:xxxxx [guid=…]" on success.
         if stdout.contains("Successfully paired") {
@@ -287,6 +281,6 @@ mod tests {
             serial: "EMULATOR".to_string(),
         };
         // Just verify it can be created; address parsing is validated above
-        assert!(info.name.len() > 0);
+        assert!(!info.name.is_empty());
     }
 }

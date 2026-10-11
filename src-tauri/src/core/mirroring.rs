@@ -9,20 +9,24 @@
 //!
 //! Server launch flags (verified against scrcpy v5.0 `Options.java`):
 //! `raw_stream=true` disables device meta, frame meta and the dummy byte, so
-//! the socket carries pure H.264 Annex-B; `control=false` keeps a single
-//! (video) connection; `tunnel_forward=true` makes the server listen on
-//! `localabstract:scrcpy`, which `adb forward` reaches.
+//! the socket carries pure H.264 Annex-B; `control=true` makes the server
+//! also accept the control socket, which is the second connection to the same
+//! forward and carries input events (see [`crate::core::input`]);
+//! `tunnel_forward=true` makes the server listen on `localabstract:scrcpy`,
+//! which `adb forward` reaches.
 //!
 //! USB transport only for now. `adb forward` is transport-agnostic, so a
 //! future Wi-Fi transport replaces the setup here, not the pipeline.
 
 use crate::core::adb;
-use crate::core::video::{self, PlaybackControl, StreamEnd};
+use crate::core::audio::{self, AudioStats};
+use crate::core::input;
+use crate::core::video::{self, PlaybackControl, StreamEnd, VideoStats};
 use serde::Serialize;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::Child;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -72,8 +76,31 @@ pub struct MirrorQuality {
     pub max_fps: u32,
 }
 
+impl MirrorQuality {
+    /// The named modes the Device page offers, mapped onto the scrcpy knobs
+    /// above. `sharp` is [`MirrorQuality::default`] — the engine's tested
+    /// behaviour — so the default path stays byte-identical; the other modes
+    /// trade pixels for bandwidth explicitly.
+    pub fn preset(name: &str) -> Result<Self, String> {
+        match name {
+            "sharp" => Ok(Self::default()),
+            "balanced" => Ok(Self {
+                max_size: 1280,
+                bitrate: 6_000_000,
+                max_fps: 60,
+            }),
+            "smooth" => Ok(Self {
+                max_size: 1024,
+                bitrate: 4_000_000,
+                max_fps: 60,
+            }),
+            other => Err(format!("unknown mirror mode '{other}'")),
+        }
+    }
+}
+
 /// Session state for the UI, pushed on change via `mirror-changed`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MirrorStatus {
     /// A session exists and has not finished yet.
@@ -87,6 +114,21 @@ pub struct MirrorStatus {
     pub height: u32,
     /// Serial of the mirrored device.
     pub serial: String,
+    /// Pipeline counters sampled once per second by the running session;
+    /// `None` when nothing is publishing them. Stage measures of the local
+    /// pipeline only — not input-to-mirror latency (that needs input
+    /// injection, Phase 3).
+    pub stats: Option<VideoStats>,
+    /// Consecutive seconds the decoded picture has carried no visible content
+    /// (`video::picture_blank_secs`). `0` while the picture shows anything.
+    /// The UI uses it to explain an empty mirror; it is a measurement of the
+    /// picture, so it names no cause.
+    pub picture_blank_secs: u32,
+    /// Audio counters sampled once per second by the running session
+    /// (`audio::stats`); `None` while no audio stream is running. `error` is
+    /// set when the desktop has no usable output device — the video session
+    /// keeps running in that case.
+    pub audio: Option<AudioStats>,
 }
 
 impl Default for MirrorStatus {
@@ -98,6 +140,9 @@ impl Default for MirrorStatus {
             width: 0,
             height: 0,
             serial: String::new(),
+            stats: None,
+            picture_blank_secs: 0,
+            audio: None,
         }
     }
 }
@@ -109,6 +154,8 @@ struct Session {
     status: Arc<Mutex<MirrorStatus>>,
     child: Option<Child>,
     thread: Option<std::thread::JoinHandle<()>>,
+    audio_thread: Option<std::thread::JoinHandle<()>>,
+    audio_stop: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -185,10 +232,56 @@ impl Session {
             }
         };
 
+        // The audio path, opened before anything else touches the forward:
+        // the server accepts in a fixed order — video, audio, control — on the
+        // same local socket, so a control connection opened first would
+        // receive the PCM stream instead of accepting input.
+        let audio_stream = match TcpStream::connect(("127.0.0.1", FORWARD_PORT)) {
+            Ok(stream) => stream,
+            Err(error) => {
+                cleanup();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "audio socket refused on 127.0.0.1:{FORWARD_PORT}: {error}"
+                ));
+            }
+        };
+        audio::reset();
+
+        // The input path. The server accepted the video and audio sockets and
+        // is now blocked in `accept()` for the control socket, so this
+        // connects immediately and the session starts streaming only once it
+        // exists.
+        let controller = match input::Controller::connect(FORWARD_PORT) {
+            Ok(controller) => Arc::new(controller),
+            Err(error) => {
+                cleanup();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        input::attach(controller);
+
         let control = Arc::new(PlaybackControl::default());
+        // Audio rides its own thread: it blocks on the socket and on the
+        // render device, so it must never hold up the picture. Its stop flag
+        // is separate from the decoder's — the socket closing is what ends the
+        // stream — and teardown trips it before joining.
+        let audio_stop = Arc::new(AtomicBool::new(false));
+        let thread_audio_stop = audio_stop.clone();
+        let audio_thread = std::thread::Builder::new()
+            .name("mirror-audio".to_string())
+            .spawn(move || audio::play(audio_stream, thread_audio_stop))
+            .map_err(|error| format!("cannot start the audio thread: {error}"));
         let status = Arc::new(Mutex::new(MirrorStatus {
             running: true,
             phase: "starting",
+            // The session's own serial, so the UI can tell which device (and
+            // which of its transports) this status belongs to. Without it every
+            // card but the first looks like it belongs to another device.
+            serial: serial.to_string(),
             ..MirrorStatus::default()
         }));
         let thread_status = status.clone();
@@ -227,11 +320,28 @@ impl Session {
                     guard.phase = phase;
                     guard.reason = reason;
                 }
+                // The stream is gone, so the control socket is too: a window
+                // that outlives it must not keep sending input.
+                input::detach();
             })
             .map_err(|error| format!("cannot start mirror session: {error}"));
         let thread = match spawned {
             Ok(thread) => thread,
             Err(error) => {
+                input::detach();
+                cleanup();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+
+        let audio_thread = match audio_thread {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                audio_stop.store(true, Ordering::SeqCst);
+                input::detach();
+                let _ = thread.join();
                 cleanup();
                 let _ = child.kill();
                 let _ = child.wait();
@@ -245,13 +355,23 @@ impl Session {
             status,
             child: Some(child),
             thread: Some(thread),
+            audio_thread,
+            audio_stop,
         })
     }
 
     /// Stop the decode thread, then reap the server process and forward.
     fn shutdown(&mut self) {
+        // No new input from the moment the session is going down.
+        input::detach();
         self.control.stop.store(true, Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        // The picture is down, so the audio stream is too: trip the flag and
+        // wait for the render device to be released before the server dies.
+        self.audio_stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.audio_thread.take() {
             let _ = thread.join();
         }
         if let Ok(adb) = adb::resolve() {
@@ -271,10 +391,23 @@ impl Session {
     }
 
     fn snapshot(&self) -> MirrorStatus {
-        self.status
+        let mut status = self
+            .status
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .clone();
+        // The counters belong to the session, not the engine: `video` publishes
+        // them once per second while it decodes. Never attach one to a status
+        // that is not running — a finished session's numbers would read as live.
+        status.stats = if status.running { video::stats() } else { None };
+        status.picture_blank_secs = if status.running {
+            video::picture_blank_secs()
+        } else {
+            0
+        };
+        // Same rule for the audio counters: they belong to the session.
+        status.audio = if status.running { audio::stats() } else { None };
+        status
     }
 
     fn is_running(&self) -> bool {
@@ -367,11 +500,18 @@ fn server_args(serial: &str, quality: MirrorQuality) -> Vec<String> {
         SERVER_VERSION.to_string(),
         // Pure H.264 Annex-B: no device meta, no frame meta, no dummy byte.
         "raw_stream=true".to_string(),
-        // Phase 2 scope: video only, no audio pipeline.
-        "audio=false".to_string(),
-        // Single connection: the one we forward is the video socket, so the
-        // server must not block waiting for a control client.
-        "control=false".to_string(),
+        // The device's own playback, as plain PCM. `audio_codec=raw` is what
+        // makes this need no decoder: the socket carries 48 kHz stereo 16-bit
+        // samples (scrcpy's `AudioConfig`), and `raw_stream=true` above also
+        // removes the audio stream header, so the bytes go straight to the
+        // desktop's audio device.
+        "audio=true".to_string(),
+        "audio_codec=raw".to_string(),
+        // Input rides scrcpy's control channel: with control enabled the
+        // server accepts a second connection on the same forward, right after
+        // the video socket. The client must open it (see `Session::start`),
+        // otherwise the server waits in `accept()` and never streams.
+        "control=true".to_string(),
         // Server listens on the abstract socket; we forward to it.
         "tunnel_forward=true".to_string(),
     ];
@@ -500,12 +640,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn server_args_keep_the_video_only_contract() {
+    fn server_args_open_the_control_channel() {
         let args = server_args("SERIAL", MirrorQuality::default());
         let joined = args.join(" ");
         assert!(joined.contains("raw_stream=true"));
-        assert!(joined.contains("audio=false"));
-        assert!(joined.contains("control=false"));
+        // Audio is forwarded as raw PCM: the device's own playback, no decoder
+        // on this side (see `core::audio`).
+        assert!(joined.contains("audio=true"));
+        assert!(joined.contains("audio_codec=raw"));
+        // Pointer input needs the control socket: the client opens the second
+        // connection to the same forward.
+        assert!(joined.contains("control=true"));
         assert!(joined.contains("tunnel_forward=true"));
         assert!(joined.contains(SERVER_CLASS));
         assert!(joined.contains(SERVER_VERSION));
@@ -535,5 +680,83 @@ mod tests {
     fn ships_the_scrcpy_server_jar() {
         let jar = server_jar().expect("bundled scrcpy server jar must exist");
         assert!(jar.is_file());
+    }
+
+    /// The webview reads these keys by name: the counters must survive
+    /// serialisation exactly as `src/lib/tauri.ts` declares them.
+    #[test]
+    fn status_serialises_the_counters_for_the_webview() {
+        let status = MirrorStatus {
+            running: true,
+            phase: "running",
+            reason: String::new(),
+            width: 720,
+            height: 1604,
+            serial: "SERIAL".to_string(),
+            stats: Some(video::VideoStats {
+                fps: 50.4,
+                bytes_per_s: 1_062_500.0,
+                decode_ms: 16.2,
+                blit_ms: 9.1,
+                overwritten: 47,
+                frames_decoded: 613,
+            }),
+            picture_blank_secs: 3,
+            audio: Some(audio::AudioStats {
+                device: "Speakers (Realtek)".to_string(),
+                sample_rate: 48_000,
+                channels: 2,
+                kbps: 1411.2,
+                peak: 9_318,
+                played_ms: 12_400,
+                total_bytes: 2_116_800,
+                error: String::new(),
+            }),
+        };
+        let json = serde_json::to_value(&status).expect("status must serialise");
+        assert_eq!(json["stats"]["fps"], 50.4);
+        assert_eq!(json["stats"]["bytesPerS"], 1_062_500.0);
+        assert_eq!(json["stats"]["decodeMs"], 16.2);
+        assert_eq!(json["stats"]["blitMs"], 9.1);
+        assert_eq!(json["stats"]["overwritten"], 47);
+        assert_eq!(json["stats"]["framesDecoded"], 613);
+        // The blank-picture run the UI turns into its notice.
+        assert_eq!(json["pictureBlankSecs"], 3);
+        // No session publishing: the field is present and null, never absent.
+        let idle = serde_json::to_value(MirrorStatus::default()).unwrap();
+        assert_eq!(idle["stats"], serde_json::Value::Null);
+        assert!(idle.get("stats").is_some());
+        // An idle status never carries a blank run from a finished session.
+        assert_eq!(idle["pictureBlankSecs"], 0);
+        // Audio counters reach the webview under the names it declares.
+        assert_eq!(json["audio"]["device"], "Speakers (Realtek)");
+        assert_eq!(json["audio"]["sampleRate"], 48_000);
+        assert_eq!(json["audio"]["channels"], 2);
+        assert_eq!(json["audio"]["kbps"], 1411.2);
+        assert_eq!(json["audio"]["peak"], 9_318);
+        assert_eq!(json["audio"]["playedMs"], 12_400);
+        assert_eq!(json["audio"]["totalBytes"], 2_116_800);
+        assert_eq!(json["audio"]["error"], "");
+        assert_eq!(idle["audio"], serde_json::Value::Null);
+    }
+}
+
+#[cfg(test)]
+mod mirror_mode_tests {
+    use super::MirrorQuality;
+
+    /// `sharp` is the shipped default, so selecting it cannot change behaviour;
+    /// the other modes only lower the knobs, and an unknown name is rejected
+    /// rather than silently accepted.
+    #[test]
+    fn named_modes_map_onto_the_quality_knobs() {
+        assert_eq!(
+            MirrorQuality::preset("sharp").unwrap(),
+            MirrorQuality::default()
+        );
+        let smooth = MirrorQuality::preset("smooth").unwrap();
+        assert_eq!(smooth.max_size, 1024);
+        assert!(smooth.bitrate <= MirrorQuality::preset("balanced").unwrap().bitrate);
+        assert!(MirrorQuality::preset("ultra").is_err());
     }
 }

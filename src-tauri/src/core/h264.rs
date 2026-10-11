@@ -103,6 +103,21 @@ impl Frame {
             Frame::Bgra { width, height, .. } => (*width, *height),
         }
     }
+
+    /// The coded picture size, padding included.
+    ///
+    /// This is the size of the surface the decoder filled, which is what a
+    /// Direct3D video processor validates its input against: the visible size
+    /// is a source rectangle inside it, not the surface size. A picture whose
+    /// coded size is not known — one the decoder already converted — is as
+    /// large as it looks.
+    pub fn coded(&self) -> (u32, u32) {
+        match self {
+            #[cfg(windows)]
+            Frame::Texture { coded, .. } => *coded,
+            Frame::Bgra { width, height, .. } => (*width, *height),
+        }
+    }
 }
 
 /// The public decoder boundary: [`Decoder::new`], [`Decoder::push`],
@@ -824,11 +839,15 @@ mod native {
                     "output type negotiated ({dimensions:?}, hardware={})",
                     self.hardware
                 ));
-                if self.hardware && self.copier.is_none() {
+                if self.hardware && self.copier.as_ref().map(Copier::coded) != Some(dimensions) {
                     let device = self
                         .device
                         .clone()
                         .ok_or_else(|| H264Error::new("the decoder lost its device"))?;
+                    // The decoder offers a placeholder size before it has seen
+                    // the stream, so the ring is built again whenever the
+                    // negotiated size changes: a ring of the wrong size would
+                    // be copied into only partially.
                     self.copier = Some(Copier::new(device, dimensions).map_err(H264Error::new)?);
                 }
                 self.output_set = true;
@@ -860,8 +879,9 @@ mod native {
             Ok(media_type)
         }
 
-        /// Pick the decoder's output type: NV12 first, then RGB32, falling
-        /// back to whatever the MFT offers.
+        /// Pick the decoder's output type: NV12 for a decoder that took the
+        /// device, RGB32 for one that decodes in system memory, falling back
+        /// to whatever the MFT offers.
         ///
         /// A live stream re-offers its types when the picture changes, which
         /// the MFT reports as `MF_E_TRANSFORM_STREAM_CHANGE`; `pull_output`
@@ -887,6 +907,10 @@ mod native {
                 .iter()
                 .find(|media_type| subtype(media_type).ok() == Some(MFVideoFormat_NV12));
 
+            let rgb32 = offered
+                .iter()
+                .find(|media_type| subtype(media_type).ok() == Some(MFVideoFormat_RGB32));
+
             // Device textures only exist in NV12, so a decoder that took the
             // device and does not offer NV12 cannot decode into textures.
             let device_type =
@@ -895,12 +919,15 @@ mod native {
             let preferred = if device_type {
                 nv12.expect("checked")
             } else {
-                nv12.or_else(|| {
-                    offered
-                        .iter()
-                        .find(|media_type| subtype(media_type).ok() == Some(MFVideoFormat_RGB32))
-                })
-                .unwrap_or(&offered[0])
+                // Decoding into system memory asks for RGB32: Media
+                // Foundation's colour converter is vectorised and works from
+                // the stream's own colour description, so the picture arrives
+                // ready to draw. Taking NV12 instead costs a pixel-at-a-time
+                // conversion in Rust (`pixels::nv12_to_bgra`) on the decode
+                // thread, which is what pins a debug build near ten frames a
+                // second and what keeps a release build off scrcpy's CPU
+                // figures.
+                rgb32.or(nv12).unwrap_or(&offered[0])
             };
 
             // A type taken from the decoder still has to be cloned: the MFT

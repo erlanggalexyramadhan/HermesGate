@@ -19,7 +19,8 @@ pub fn run() {
             commands::wifi_disconnect,
             commands::start_mirror,
             commands::stop_mirror,
-            commands::mirror_status
+            commands::mirror_status,
+            commands::mirror_key
         ])
         .setup(|app| {
             use tauri::Manager;
