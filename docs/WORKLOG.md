@@ -935,3 +935,57 @@ and screen size, and re-measure parity through the new window frame.
 No commit, no push, no unrelated refactor, Obsidian untouched. Docs updated: this entry, PRD (mission
 bullet superseded, device-page section, mirror-window bullet, diagnostics-panel rationale),
 `architecture.md` (device detection: identity, endpoints, no stale card; mirror window).
+
+## Milestone 13: v0.1.0 published (Complete)
+
+### Why
+Turn the verified Phase 0-2 work into a shipped release. Only genuine blockers were touched; the
+already-verified behaviour from Milestones 12g/12h was reused rather than re-tested.
+
+### Blockers found
+1. **`main` had a red CI run** (push from 2026-10-08). The Rust job ran on `ubuntu-latest`, and
+   `cargo clippy -D warnings` failed there in `tests/h264_offline.rs` with
+   `irrefutable-let-patterns`: the `Frame::Texture` variant is `#[cfg(windows)]`, so off Windows the
+   `Frame::Bgra { .. }` pattern always matches. `cargo test` would not have linked on Linux either —
+   the crate links Windows import libraries (Media Foundation, D3D11, WASAPI). The job was measuring
+   a platform the product does not ship on.
+2. **Three clippy `-D warnings` failures on Windows** in code added this session:
+   `chunks_exact(2)` twice in `core/audio.rs` (`clippy::chunks_exact_to_as_chunks`) and
+   `info.name.len() > 0` in `core/connection/wifi.rs` (`clippy::len_zero`).
+3. **Documentation that contradicted the product**: `README.md` and `docs/roadmap.md` still described
+   the repository as "Phase 1 — device detection, mirroring not implemented yet". A release whose own
+   front page denies the shipped feature is not publishable.
+
+### Fixes
+- `ci.yml`: the Rust job moved to `windows-latest` (the Tauri system-package step dropped with it);
+  the frontend job stays on ubuntu.
+- `core/audio.rs` uses `as_chunks::<2>()`; `core/connection/wifi.rs` uses `!info.name.is_empty()`.
+- README status/what-exists/repository-layout and roadmap phases 1-5 updated to the shipped state
+  (clipboard sync, persisted settings and pointer/gesture input stay marked as not implemented).
+
+### Verified
+- The CI-equivalent checks once, locally on Windows: `cargo fmt --all -- --check` clean,
+  `cargo clippy --all-targets -- -D warnings` clean, `cargo test` green (44 unit + 2 integration,
+  1 ignored), `npm run build` green.
+- CI on the release commit (`c7b9b92`): **success**, run 38146686175.
+- The packaged production build (not the dev build) was driven over CDP on port 9224 against the real
+  device: `ADB: bundled` (the packaged resource layout resolves the bundled ADB — not the dev tree),
+  one card `ONLINE · bc058b2c · OPPO · Android 14 · USB + Wi-Fi`, session start from the card button
+  reaching 720 x 1604 px at **28.5 decode FPS**, **10.7 Mbit/s** received, audio 48 kHz · 1573 kbit/s,
+  2861 frames decoded, and stop returning the session to `IDLE`.
+- Both release assets re-read from the remote after upload (`gh release view`): state `uploaded`,
+  7 393 280 bytes (MSI) and 5 536 162 bytes (NSIS), and both download URLs answer.
+
+### Limits
+One device (OPPO CPH2773, Android 14) and one host. The installers are unsigned, so SmartScreen warns.
+Installing from the MSI/NSIS was not performed on this machine: the packaged binary was exercised from
+`target/release`, which is the layout the installers produce (`binaries/` beside the executable), but
+the installer's own file placement was not verified by installing.
+
+### Artifacts
+`HermesGate_0.1.0_x64_en-US.msi`, `HermesGate_0.1.0_x64-setup.exe`
+(https://github.com/erlanggalexyramadhan/HermesGate/releases/tag/v0.1.0).
+
+### Report
+Committed `c7b9b92` and pushed to `main`; tag `v0.1.0` on the same commit, GitHub Release published
+(not a draft, not a prerelease). No secrets in the tree; nothing outside the project touched.
