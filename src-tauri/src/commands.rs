@@ -160,6 +160,24 @@ pub fn wifi_connect(
     Ok(())
 }
 
+/// One QR pairing ticket: the string the phone's camera reads, the mDNS service
+/// name the phone was asked to publish, and the QR matrix the UI draws.
+///
+/// The matrix is a flat row-major `width × width` bitmap (`true` = dark) so the
+/// webview needs no QR encoder of its own — the native core already carries one.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WifiQrTicket {
+    /// The payload to encode: `WIFI:T:ADB;S:<service>;P:<code>;;`.
+    pub payload: String,
+    /// Instance name the phone must publish while it waits (`hermesgate-…`).
+    pub service: String,
+    /// Matrix side length in modules.
+    pub width: usize,
+    /// Row-major `width × width` modules, `true` meaning a dark module.
+    pub modules: Vec<bool>,
+}
+
 /// Disconnect a wireless device: `adb disconnect <address>`.
 #[tauri::command(async)]
 pub fn wifi_disconnect(
@@ -172,6 +190,57 @@ pub fn wifi_disconnect(
     let addr = parse_address(&address)?;
     manager.disconnect_device(addr)?;
     Ok(())
+}
+
+/// Step 1 of QR pairing: mint a fresh ticket and hand the webview the QR to
+/// show. Nothing is spawned here — the phone's camera is the scanner.
+///
+/// The ticket is remembered as the *only* acceptable one: [`wifi_qr_await`]
+/// consumes it, so a QR left on screen from an earlier attempt can never pair
+/// a device later.
+#[tauri::command]
+pub fn wifi_qr_start(
+    wifi: tauri::State<'_, Option<core::connection::wifi::WifiManager>>,
+) -> Result<WifiQrTicket, String> {
+    let manager = wifi
+        .as_ref()
+        .ok_or_else(|| "ADB runtime unavailable; wireless pairing is disabled".to_string())?;
+    let code = manager.start_qr_pairing();
+    let payload = code.payload();
+    let (width, modules) = core::connection::qr::modules(&payload)?;
+    Ok(WifiQrTicket {
+        payload,
+        service: code.service().to_string(),
+        width,
+        modules,
+    })
+}
+
+/// Step 2 of QR pairing: wait (up to `timeout_secs`, default 120) for the phone
+/// that scanned the ticket to answer, pair with it, and best-effort connect.
+///
+/// Blocking, so it runs on a blocking thread and the webview stays responsive
+/// while the user walks to the phone.
+#[tauri::command(async)]
+pub async fn wifi_qr_await(
+    timeout_secs: Option<u64>,
+    wifi: tauri::State<'_, Option<core::connection::wifi::WifiManager>>,
+) -> Result<core::connection::wifi::QrPairingOutcome, String> {
+    let manager = wifi
+        .as_ref()
+        .ok_or_else(|| "ADB runtime unavailable; wireless pairing is disabled".to_string())?;
+    let code = manager.take_qr_code()?;
+    let adb = manager.adb_path().to_path_buf();
+    let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(120));
+
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        core::connection::wifi::pair_over_mdns(&adb, &code, timeout)
+    })
+    .await
+    .map_err(|e| format!("QR pairing task failed: {e}"))??;
+
+    manager.note_qr_outcome(&outcome.paired, outcome.connected.as_deref());
+    Ok(outcome)
 }
 
 /// Poll the mirror engine and broadcast a fresh snapshot as

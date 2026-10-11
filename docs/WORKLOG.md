@@ -989,3 +989,36 @@ the installer's own file placement was not verified by installing.
 ### Report
 Committed `c7b9b92` and pushed to `main`; tag `v0.1.0` on the same commit, GitHub Release published
 (not a draft, not a prerelease). No secrets in the tree; nothing outside the project touched.
+
+---
+
+## Milestone 6: QR pairing for wireless debugging (2026-10-11)
+
+### What changed
+| File | Change |
+|------|--------|
+| `src-tauri/src/core/connection/qr.rs` | New. The pairing ticket: `PairingCode::generate` (service `hermesgate-…`, 10-digit secret), `payload()` in the format Android's own `AdbQrCode` reads (`WIFI:T:ADB;S:<service>;P:<secret>;;`), ZXing escaping of `\ ; , :`, a strict `parse()` that rejects anything the device would reject, and `modules()` turning the payload into a QR matrix |
+| `src-tauri/src/core/connection/wifi.rs` | `MdnsService` + `parse_mdns_services()` for `adb mdns services`; `pair_over_mdns()` waits for the phone that scanned the ticket, runs `adb pair`, then best-effort `adb connect` on the phone's `_adb-tls-connect._tcp`; `WifiManager` holds the pending (single-use) ticket and records `Paired` vs `Connected` truthfully |
+| `src-tauri/src/commands.rs`, `lib.rs` | `wifi_qr_start` (mint + matrix) and `wifi_qr_await` (blocking wait on a blocking thread) registered; manual `wifi_pair` / `wifi_connect` / `wifi_disconnect` untouched |
+| `src/lib/tauri.ts`, `src/App.tsx`, `src/App.css` | QR panel inside Manual Connect: one button mints, draws and awaits; canvas at one pixel per module plus the 4-module quiet zone |
+
+The direction of the flow is Android's, not ours: the **phone's camera** scans the code this host
+displays (Developer options → Wireless debugging → Pair device with QR code). No host-side camera is
+involved, and the manual `adb pair` path is unchanged.
+
+### Verified (automatic, no device involved)
+- `cargo test --lib`: **56 passed, 0 failed** — including the ticket round trip, rejection of every
+  payload the device rejects, the AOSP example payload (`WIFI:T:ADB;S:studio-g@<xeYnap/;P:(Aq+v9>Cx>!/;;`),
+  mDNS service parsing, single-use tickets, and `Paired`-vs-`Connected` state.
+- `cargo fmt --all -- --check` clean, `cargo clippy --all-targets -- -D warnings` clean.
+- `npm run build` (`tsc && vite build`) green.
+- **Independent decode**: jsQR 1.4.0 over the module matrix the Rust encoder produced decoded back to
+  exactly the expected payload (33×33 modules), so the encode path is verified end to end, not just
+  self-consistent.
+
+### Not verified (no Android device available)
+The physical handshake: the phone scanning the on-screen code, publishing `_adb-tls-pairing._tcp` under
+the requested instance name, `adb pair` succeeding against that address, and the follow-up
+`adb connect`. This is the phone's side of the protocol and is unchanged by this work; the wait/pair
+step is exercised only against real hardware.
+

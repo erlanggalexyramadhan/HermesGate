@@ -194,10 +194,34 @@ export const mirror = {
 };
 
 /**
+ * One QR pairing ticket minted by the host: the string the phone's camera
+ * reads, the mDNS name the phone publishes while it waits, and the QR matrix
+ * (flat row-major `width × width`, `true` = dark) the panel draws.
+ */
+export type WifiQrTicket = {
+  payload: string;
+  service: string;
+  width: number;
+  modules: boolean[];
+};
+
+/** What a finished QR pairing ended up doing. */
+export type QrPairingOutcome = {
+  /** `ip:port` the phone answered the pairing on. */
+  paired: string;
+  /** `ip:port` that was connected afterwards, when it was announced in time. */
+  connected: string | null;
+};
+
+/**
  * Wireless ADB pairing and connections. `pair` takes the `ip:port` shown on
  * the device's wireless-debugging screen plus the six-digit pairing key;
  * `connect`/`disconnect` drive endpoints that are already paired. Every call
  * rejects with a plain message (for example when no ADB runtime exists).
+ *
+ * QR pairing is the same flow with the phone as the scanner: `qrStart` mints a
+ * ticket to display, `qrAwait` waits for the phone that scanned it and pairs.
+ * The ticket is single use — call `qrStart` again for another attempt.
  */
 export const wireless = {
   pair: (address: string, key: string) =>
@@ -205,4 +229,7 @@ export const wireless = {
   connect: (address: string) => invoke<void>("wifi_connect", { address }),
   disconnect: (address: string) =>
     invoke<void>("wifi_disconnect", { address }),
+  qrStart: () => invoke<WifiQrTicket>("wifi_qr_start"),
+  qrAwait: (timeoutSecs?: number) =>
+    invoke<QrPairingOutcome>("wifi_qr_await", { timeoutSecs }),
 };

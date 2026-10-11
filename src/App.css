@@ -702,6 +702,45 @@ code {
   color: var(--accent-amber);
 }
 
+/* ---------- QR pairing ---------- */
+
+.qr-pair {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 18px;
+  padding: 14px 16px;
+}
+
+.qr-copy {
+  display: flex;
+  flex: 1 1 220px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.qr-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.qr-pair .pair-result {
+  padding: 0;
+}
+
+/* One CSS pixel per module, scaled by the box: the matrix stays crisp.
+   White on purpose — a scanner needs the light quiet zone, not the panel. */
+.qr-canvas {
+  flex: 0 0 auto;
+  width: 176px;
+  height: 176px;
+  border-radius: 8px;
+  background: #ffffff;
+  image-rendering: pixelated;
+}
+
 .disc-body {
   display: flex;
   flex-direction: column;

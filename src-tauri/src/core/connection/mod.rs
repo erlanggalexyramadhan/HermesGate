@@ -7,6 +7,7 @@
 
 use serde::Serialize;
 
+pub mod qr;
 pub mod usb;
 pub mod wifi;
 

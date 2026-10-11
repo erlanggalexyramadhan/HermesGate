@@ -29,7 +29,8 @@ workflows.
 - **Audio forwarding** — the device's audio stream is played on the desktop
   output through WASAPI.
 - **Wi-Fi transport** — wireless debugging pairing and discovery (mDNS, `adb
-  pair`) alongside USB, with disconnect in the UI.
+  pair`) alongside USB, with disconnect in the UI, and **QR pairing**: the host
+  shows the code, the phone's camera scans it.
 - **Navigation keys** — back / home / recents are injected into the running
   session's control channel.
 - **Live session telemetry** — decode FPS, received bandwidth, decode/present

@@ -17,6 +17,8 @@ pub fn run() {
             commands::wifi_pair,
             commands::wifi_connect,
             commands::wifi_disconnect,
+            commands::wifi_qr_start,
+            commands::wifi_qr_await,
             commands::start_mirror,
             commands::stop_mirror,
             commands::mirror_status,

@@ -10,7 +10,7 @@
  * mirror engine and the audio engine, each pushed to this UI as an event. The
  * webview renders what the core reports and invents no field of its own.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   core,
@@ -23,6 +23,7 @@ import {
   type MirrorStatus,
   type ModuleInfo,
   type Transport,
+  type WifiQrTicket,
 } from "./lib/tauri";
 import "./App.css";
 
@@ -35,6 +36,106 @@ const NAV: { id: View; label: string; ready: boolean; icon: ReactNode }[] = [
   { id: "devices", label: "Devices", ready: true, icon: <IconPhone /> },
   { id: "settings", label: "Settings", ready: false, icon: <IconSliders /> },
 ];
+
+/** Quiet zone a QR code needs around its matrix, in modules. */
+const QR_QUIET_ZONE = 4;
+
+/**
+ * Paint a QR ticket onto `canvas` at one pixel per module (the CSS scales it
+ * up). White background, black modules, `QR_QUIET_ZONE` modules of margin —
+ * without that margin a scanner cannot lock onto the code.
+ */
+function drawQr(canvas: HTMLCanvasElement, ticket: WifiQrTicket) {
+  const side = ticket.width + QR_QUIET_ZONE * 2;
+  canvas.width = side;
+  canvas.height = side;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, side, side);
+  ctx.fillStyle = "#000000";
+  for (let y = 0; y < ticket.width; y += 1) {
+    for (let x = 0; x < ticket.width; x += 1) {
+      if (ticket.modules[y * ticket.width + x]) {
+        ctx.fillRect(x + QR_QUIET_ZONE, y + QR_QUIET_ZONE, 1, 1);
+      }
+    }
+  }
+}
+
+/**
+ * QR pairing: the host shows the code and the **phone's camera** scans it
+ * (Developer options → Wireless debugging → Pair device with QR code). The
+ * ticket is minted, displayed, and awaited in one press; the native side pairs
+ * as soon as the phone answers, and the ticket is then spent — a new attempt
+ * needs a new code, so a stale QR on screen can never pair anything.
+ */
+function QrPair() {
+  const [ticket, setTicket] = useState<WifiQrTicket | null>(null);
+  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const canvas = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    if (ticket && canvas.current) drawQr(canvas.current, ticket);
+  }, [ticket]);
+
+  const start = () => {
+    setBusy(true);
+    setResult(null);
+    setTicket(null);
+    wireless
+      .qrStart()
+      .then((minted) => {
+        setTicket(minted);
+        return wireless.qrAwait(120);
+      })
+      .then((outcome) => {
+        setResult({
+          ok: true,
+          text: outcome.connected
+            ? `Paired and connected at ${outcome.connected}.`
+            : `Paired at ${outcome.paired} — turn Wireless debugging on to connect.`,
+        });
+      })
+      .catch((err) => setResult({ ok: false, text: String(err) }))
+      .finally(() => {
+        setBusy(false);
+        setTicket(null);
+      });
+  };
+
+  return (
+    <div className="qr-pair">
+      <div className="qr-copy">
+        <p className="qr-note">
+          Pair by QR code — the phone scans this screen.
+        </p>
+        <button type="button" className="btn btn-primary" onClick={start} disabled={busy}>
+          {busy ? "Waiting for the phone…" : "Show QR code"}
+        </button>
+        <p className="qr-note">
+          {ticket
+            ? "On the device: Developer options → Wireless debugging → Pair device with QR code, then scan this screen."
+            : "The phone's camera does the scanning — no address or code to type."}
+        </p>
+        {result && (
+          <p className={result.ok ? "pair-result is-ok" : "pair-result is-error"}>
+            {result.text}
+          </p>
+        )}
+      </div>
+      {ticket && (
+        <canvas
+          ref={canvas}
+          className="qr-canvas"
+          role="img"
+          aria-label={`Wireless-debugging pairing code ${ticket.service}`}
+        />
+      )}
+    </div>
+  );
+}
 
 /**
  * Mirroring modes, in the order the Device page lists them. The knobs behind
@@ -465,6 +566,9 @@ function DevicePage() {
                 {pairResult.text}
               </p>
             )}
+          </div>
+          <div className="panel">
+            <QrPair />
           </div>
         </section>
       )}
